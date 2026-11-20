@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/handler/dto"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/adminaccess"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -27,6 +28,25 @@ type scopedProxyOption struct {
 
 func scopedProxyDTO(p service.Proxy) scopedProxyOption {
 	return scopedProxyOption{ID: p.ID, Name: p.Name, Protocol: p.Protocol, Host: p.Host, Port: p.Port, Status: p.Status, ExpiresAt: p.ExpiresAt}
+}
+
+// scopedAdminProxyWriteResponse 让持有 proxies.write 的受限密钥写入后也只得到公开字段，
+// 否则更新任意代理都能顺带读回已保存的用户名和密码。
+func scopedAdminProxyWriteResponse(c *gin.Context, p *service.Proxy) any {
+	if p != nil && adminaccess.FromContext(c.Request.Context()) != nil {
+		return scopedProxyDTO(*p)
+	}
+	return dto.ProxyFromServiceAdmin(p)
+}
+
+// scopedAdminProxyCreateScope 按密钥隔离幂等缓存：同一管理员的完整请求与受限请求
+// 响应形状不同，不能互相重放对方缓存的响应。
+func scopedAdminProxyCreateScope(c *gin.Context) string {
+	scope := "admin.proxies.create"
+	if principal := adminaccess.FromContext(c.Request.Context()); principal != nil {
+		scope += ":scoped:" + principal.KeyID
+	}
+	return scope
 }
 
 // scopedAdminProxyRead 对代理读取限定数量；无分页的 /all 从全池抽样。

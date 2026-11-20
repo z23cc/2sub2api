@@ -68,6 +68,8 @@ func scopedCodexPermissions(credentials, extra map[string]any, proxy *int64) ([]
 		case "import_source", "imported_at", "auth_provider", "session_token_present", "session_expires_at", "user_image", "user_picture", "account_structure", "account_residency_region", "compute_residency", "access_token_sha256":
 		case "codex_fingerprint_mode", "openai_oauth_responses_websockets_v2_enabled", "openai_oauth_responses_websockets_v2_mode":
 			permissions = append(permissions, "accounts.network")
+		case "base_rpm":
+			// 值范围由处理器校验；限速与并发同属调度配置，已含在默认的 accounts.schedule 内。
 		default:
 			return nil, infraerrors.BadRequest("SCOPED_CODEX_FIELD", "导入包含未开放的扩展字段")
 		}

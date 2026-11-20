@@ -55,7 +55,7 @@ func TestScopedProxyReadBoundedPaginationAndProjection(t *testing.T) {
 		query                     string
 		status, page, size, count int
 	}{
-		{"", 200, 1, 50, 50}, {"?page=2&page_size=50000", 200, 2, 100, 100}, {"?page=201&page_size=100", 200, 201, 100, 100},
+		{"", 200, 1, 50, 50}, {"?page_size=100&status=active", 200, 1, 100, 100}, {"?page=2&page_size=50000", 200, 2, 100, 100}, {"?page=201&page_size=100", 200, 201, 100, 100},
 		{"?page=-1", 400, 0, 0, 0}, {"?page_size=0", 400, 0, 0, 0}, {"?page_size=no", 400, 0, 0, 0}, {"?page=999999999999999999999", 400, 0, 0, 0},
 		{"?ids=1,2,3&page=2&page_size=2", 200, 2, 2, 1}, {"?ids=", 200, 1, 50, 0},
 		{"?ids=999,1&page_size=1", 200, 1, 1, 1}, {"?ids=1,2,2&page=4&page_size=1", 200, 4, 1, 0},
@@ -133,6 +133,7 @@ func TestScopedProxyReadRejectsLargeIDBatchAndRequiresPermission(t *testing.T) {
 			require.Equal(t, 200, w.Code)
 			require.NotContains(t, w.Body.String(), "secret-")
 			require.NotContains(t, w.Body.String(), "username")
+			require.NotContains(t, w.Body.String(), "password")
 		} else {
 			require.Equal(t, 403, w.Code)
 		}

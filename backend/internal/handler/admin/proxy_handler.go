@@ -164,7 +164,7 @@ func (h *ProxyHandler) Create(c *gin.Context) {
 		return
 	}
 
-	executeAdminIdempotentJSON(c, "admin.proxies.create", req, service.DefaultWriteIdempotencyTTL(), func(ctx context.Context) (any, error) {
+	executeAdminIdempotentJSON(c, scopedAdminProxyCreateScope(c), req, service.DefaultWriteIdempotencyTTL(), func(ctx context.Context) (any, error) {
 		var expiresAt *time.Time
 		if req.ExpiresAt != nil && *req.ExpiresAt > 0 {
 			t := time.Unix(*req.ExpiresAt, 0).UTC()
@@ -185,7 +185,7 @@ func (h *ProxyHandler) Create(c *gin.Context) {
 		if err != nil {
 			return nil, err
 		}
-		return dto.ProxyFromServiceAdmin(proxy), nil
+		return scopedAdminProxyWriteResponse(c, proxy), nil
 	})
 }
 
@@ -235,7 +235,7 @@ func (h *ProxyHandler) Update(c *gin.Context) {
 		return
 	}
 
-	response.Success(c, dto.ProxyFromServiceAdmin(proxy))
+	response.Success(c, scopedAdminProxyWriteResponse(c, proxy))
 }
 
 // Delete handles deleting a proxy

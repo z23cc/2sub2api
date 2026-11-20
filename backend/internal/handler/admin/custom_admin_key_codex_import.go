@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"math"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/adminaccess"
@@ -42,12 +43,30 @@ func validateScopedCodexRequest(req scopedCodexSessionImportRequest) error {
 			_, valid = value.(string)
 		case "openai_oauth_responses_websockets_v2_enabled":
 			_, valid = value.(bool)
+		case "base_rpm":
+			valid = validScopedBaseRPM(value)
 		}
 		if !valid {
 			return infraerrors.BadRequest("SCOPED_CODEX_FIELD", "extra 包含不支持的字段或值类型")
 		}
 	}
 	return nil
+}
+
+// base_rpm 只接受 0 到 1,000,000 的整数；JSON 数字解码为 float64，其余类型一律无效。
+func validScopedBaseRPM(value any) bool {
+	var n float64
+	switch v := value.(type) {
+	case float64:
+		n = v
+	case int:
+		n = float64(v)
+	case int64:
+		n = float64(v)
+	default:
+		return false
+	}
+	return n >= 0 && n <= 1000000 && n == math.Trunc(n)
 }
 
 func (h *AccountHandler) scopedAdminImportCodexSession(c *gin.Context) {
@@ -129,7 +148,7 @@ func (h *AccountHandler) importScopedCodexSessions(ctx context.Context, api serv
 		var account *service.Account
 		action := "created"
 		var existing *service.Account
-		if updateExisting {
+		if updateExisting || req.SkipExisting {
 			candidates, lookupErr := api.ScopedAdminCodexCandidates(ctx, service.ScopedCodexIdentity{
 				AccountID: item.AccountID, UserID: item.UserID, Email: item.Email, AccessToken: item.AccessToken,
 				AccessTokenOnly: item.RefreshToken == "" && item.AccessToken != "", AgentIdentity: item.IsAgentIdentity,
@@ -138,6 +157,12 @@ func (h *AccountHandler) importScopedCodexSessions(ctx context.Context, api serv
 				return result, lookupErr
 			}
 			existing, _ = buildCodexAccountIndex(candidates).Find(item.IdentityKeys, item.UserID)
+		}
+		// skip_existing 优先于 update_existing：已有账户只记为跳过，不更新也不新建。
+		if existing != nil && req.SkipExisting {
+			result.Skipped++
+			result.Items = append(result.Items, CodexSessionImportItem{Index: entry.Index, Action: "skipped", AccountID: existing.ID})
+			continue
 		}
 		if updateExisting && existing != nil {
 			action = "updated"

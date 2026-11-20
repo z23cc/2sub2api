@@ -35,6 +35,8 @@
 
 此处修改的是上游 `model_allowlist`，会影响整个分组可调用的模型，不能当作只改变前端展示的列表。写接口只允许单独提交 `model_allowlist`，不能借此修改费率等其他分组设置。只授予分组模型读取时，响应仅提供分组 ID、名称、平台和模型白名单；授予全站 `groups.read` 后才可读取完整分组配置。
 
+`groups.write` 是全站权限，允许 `POST /api/v1/admin/groups` 创建分组和 `PUT /api/v1/admin/groups/<ID>` 完整修改分组设置（含费率等字段），不再受所选分组限制，仅应授予确实需要管理分组的任务。持有 `groups.write` 时，`PUT` 交给完整分组处理器；只有 `groups.models.write` 时仍只能单独提交 `model_allowlist`。
+
 读取指定分组的候选模型须有该分组的读取授权，或者全站 `groups.read`。读取默认模型候选（分组 ID 为 `0`）须独立授予 `models.defaults.read`。
 
 ## 全站权限和响应边界
@@ -45,8 +47,9 @@
 
 受限响应按用途收窄：
 
-- 账户读取返回基本管理信息和模型映射，不返回 OAuth token、API 密钥、任意 `extra` 或完整凭证。`accounts.credentials` 是写入权限，不提供读取凭证的能力。
-- 代理候选包含 ID、名称、协议、主机、端口、状态与到期时间，不包含代理认证用户名或密码。
+- 账户读取返回基本管理信息和模型映射，不返回 OAuth token、API 密钥或完整凭证。`accounts.credentials` 是写入权限，不提供读取凭证的能力。授予 `accounts.read` 后另外返回非机密的状态字段 `error_message`、`rate_limit_reset_at`、`overload_until`、`temp_unschedulable_until`、`proxy_id`、`expires_at`（Unix 秒）、`last_used_at`，以及只含 `base_rpm`、`codex_5h_used_percent`、`codex_5h_reset_at`、`codex_5h_reset_after_seconds`、`codex_7d_used_percent`、`codex_7d_reset_at`、`codex_7d_reset_after_seconds` 的 `extra`；`extra` 的其他键一律不返回。
+- `accounts.usage.read` 是账户资源权限，按账户逐个检查，可读取 `POST /api/v1/admin/accounts/today-stats/batch`、`POST /api/v1/admin/accounts/usage/batch` 和 `GET /api/v1/admin/accounts/<ID>/stats`。两个批量接口会从 `account_ids` 去掉无权读取的账户（含不存在的账户），单账户接口无权时返回 404。
+- 代理候选包含 ID、名称、协议、主机、端口、状态与到期时间，不包含代理认证用户名或密码。`proxies.write` 是全站权限，允许创建、修改、删除与测试代理（`POST /proxies`、`PUT /proxies/<ID>`、`DELETE /proxies/<ID>`、`POST /proxies/<ID>/test`），这些响应对受限密钥同样不返回用户名和密码。
 - 用户资料采用字段白名单；联系方式需要 `users.read`，余额字段需要 `users.balance.read`，分组配置字段需要 `groups.read`。用户响应不嵌入订阅和用量关联数据，这些能力由各自接口及权限控制。
 - 订阅响应不嵌入用户、分配管理员或完整分组；仅有订阅或平台额度写权限时，成功响应只确认资源 ID，不附带独立读取权限的数据。
 - 用量记录仅返回请求自身的用量、计费快照及关联 ID，不嵌入用户 API Key、账户凭证或用户财务资料。优惠码使用记录及公告阅读记录也只返回记录字段与用户 ID。
@@ -78,7 +81,8 @@
 - 必须明确提供 `group_ids`；新账户固定为 `openai` 平台、`oauth` 类型，目标分组逐一检查。
 - 新建需要 `accounts.create`、`accounts.credentials` 和 `accounts.schedule`。更新匹配账户会重新检查当前资源和对应写权限；调整关联还需要 `accounts.groups`。
 - `base_url`、代理、指纹或 WebSocket 连接配置需要 `accounts.network`；`model_mapping` 需要 `accounts.models.write`。
-- `credential_extras` 只接受独立授权的 `base_url`、`model_mapping`；`extra` 只开放已登记的 Codex 指纹及 WebSocket 选项，不支持任意字段透传或跳过混合渠道风险检查。
+- `credential_extras` 只接受独立授权的 `base_url`、`model_mapping`；`extra` 只开放已登记的 Codex 指纹、WebSocket 选项和 `base_rpm`（0 到 1,000,000 的整数，随 `accounts.schedule` 授权），不支持任意字段透传或跳过混合渠道风险检查。
+- `skip_existing: true` 时，按与 `update_existing` 相同的身份查找已有账户：找到就记为 `skipped` 并返回已有账户的 `account_id`，不更新也不新建；找不到则照常新建。`skip_existing` 优先于 `update_existing`。
 - 导入只按当前条目的身份查询受限候选，响应不返回候选凭证。更新已有账户时仍会在写入阶段重验身份与权限。
 
 ## API 示例

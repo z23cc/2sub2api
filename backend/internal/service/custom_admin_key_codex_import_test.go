@@ -172,3 +172,16 @@ func TestScopedCodexWriteAuthorizationAndTransactions(t *testing.T) {
 	require.Equal(t, 403, infraerrors.Code(err))
 	require.Equal(t, 1, called)
 }
+
+func TestScopedCodexBaseRPMRequiresOnlyCredentialsAndSchedule(t *testing.T) {
+	credentials := map[string]any{"access_token": "fixture"}
+	extra := map[string]any{"base_rpm": float64(120)}
+	permissions, err := scopedCodexPermissions(credentials, extra, nil)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"accounts.credentials", "accounts.schedule"}, permissions)
+
+	extra["unknown"] = 1
+	_, err = scopedCodexPermissions(credentials, extra, nil)
+	require.Equal(t, 400, infraerrors.Code(err))
+	require.Equal(t, "SCOPED_CODEX_FIELD", infraerrors.Reason(err))
+}

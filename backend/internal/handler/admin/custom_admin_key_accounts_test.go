@@ -10,7 +10,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/handler/dto"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/adminaccess"
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
@@ -24,13 +26,74 @@ func TestScopedAdminAccountDTORedactsSecretsAndForeignGroups(t *testing.T) {
 	a := &service.Account{ID: 9, Type: "oauth", GroupIDs: []int64{1, 2}, Credentials: map[string]any{"access_token": "TOP_SECRET", "refresh_token": "REFRESH_SECRET", "base_url": "URL_SECRET", "model_mapping": map[string]any{"alias": "target", "invalid": map[string]any{"token": "NESTED_SECRET"}}}, Extra: map[string]any{"private": "EXTRA_SECRET"}}
 	body, _ := json.Marshal(scopedAdminAccountDTO(a, p))
 	s := string(body)
-	if strings.Contains(s, "SECRET") || strings.Contains(s, "extra") {
+	if strings.Contains(s, "SECRET") {
 		t.Fatalf("泄漏敏感字段: %s", s)
 	}
 	require.Contains(t, s, `"credentials":{"model_mapping":{"alias":"target"}}`)
 	if !strings.Contains(s, `"group_ids":[1]`) {
 		t.Fatalf("泄漏越权组: %s", s)
 	}
+}
+
+func TestScopedAdminAccountDTOIncludesOnlyAllowedStatusAndExtra(t *testing.T) {
+	expires := time.Unix(1800000000, 123).UTC()
+	rateReset := expires.Add(-time.Hour)
+	overload := expires.Add(-2 * time.Hour)
+	tempUnschedulable := expires.Add(-3 * time.Hour)
+	lastUsed := expires.Add(-4 * time.Hour)
+	proxyID := int64(23)
+	allowedExtra := map[string]any{
+		"base_rpm":              120,
+		"codex_5h_used_percent": 25, "codex_5h_reset_at": "2027-01-15T10:00:00Z", "codex_5h_reset_after_seconds": 60,
+		"codex_7d_used_percent": 45, "codex_7d_reset_at": "2027-01-18T10:00:00Z", "codex_7d_reset_after_seconds": 300,
+	}
+	extra := map[string]any{"private": "EXTRA_SECRET"}
+	for key, value := range allowedExtra {
+		extra[key] = value
+	}
+	account := &service.Account{
+		ID: 9, Name: "测试账号", Type: service.AccountTypeOAuth, GroupIDs: []int64{7},
+		ErrorMessage: "账号限流", RateLimitResetAt: &rateReset, OverloadUntil: &overload,
+		TempUnschedulableUntil: &tempUnschedulable, LastUsedAt: &lastUsed, ProxyID: &proxyID, ExpiresAt: &expires,
+		Extra: extra, Credentials: map[string]any{
+			"access_token": "ACCESS_SECRET", "refresh_token": "REFRESH_SECRET",
+			"model_mapping": map[string]string{"alias": "target"},
+		},
+	}
+	read := adminaccess.Policy{Rules: []adminaccess.Rule{{
+		Permissions: []string{"accounts.read"}, GroupIDs: []int64{7}, AccountTypes: []string{service.AccountTypeOAuth},
+	}}}
+	encode := func(v any) map[string]json.RawMessage {
+		t.Helper()
+		raw, err := json.Marshal(v)
+		require.NoError(t, err)
+		var fields map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(raw, &fields))
+		return fields
+	}
+	fullFields := encode(dto.AccountFromServiceShallow(account))
+	scopedDTO := scopedAdminAccountDTO(account, read)
+	raw, err := json.Marshal(scopedDTO)
+	require.NoError(t, err)
+	require.NotContains(t, string(raw), "SECRET")
+	scopedFields := encode(scopedDTO)
+	noRead := encode(scopedAdminAccountDTO(account, adminaccess.Policy{}))
+	for _, key := range []string{"error_message", "rate_limit_reset_at", "overload_until", "temp_unschedulable_until", "proxy_id", "expires_at", "last_used_at"} {
+		require.Contains(t, fullFields, key)
+		require.Equal(t, fullFields[key], scopedFields[key], key)
+		require.NotContains(t, noRead, key)
+	}
+	require.Equal(t, "1800000000", string(scopedFields["expires_at"]))
+	require.JSONEq(t, `{"model_mapping":{"alias":"target"}}`, string(scopedFields["credentials"]))
+	wantExtra, err := json.Marshal(allowedExtra)
+	require.NoError(t, err)
+	require.JSONEq(t, string(wantExtra), string(scopedFields["extra"]))
+	require.NotContains(t, noRead, "credentials")
+	require.NotContains(t, noRead, "extra")
+	require.Equal(t, "9", string(noRead["id"]))
+
+	account.Extra = nil
+	require.Equal(t, "{}", string(encode(scopedAdminAccountDTO(account, read))["extra"]))
 }
 
 func TestScopedAdminAccountErrorsAreClassifiedAndRedacted(t *testing.T) {

@@ -42,6 +42,10 @@ func (h *GroupHandler) ScopedAdminKeyGroupModels(c *gin.Context) {
 	if fullRead && path == base && c.Request.Method == http.MethodGet && h.isSimpleMode() {
 		return
 	}
+	// 持有 groups.write 时放行完整更新；只有 groups.models.write 时仍只能改模型白名单。
+	if path == base && c.Request.Method == http.MethodPut && slices.Contains(p.Policy.GlobalPermissions, "groups.write") {
+		return
+	}
 	candidates := path == base+"/model-allowlist-candidates"
 	if !candidates && path != base {
 		return

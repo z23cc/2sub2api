@@ -42,6 +42,37 @@ func scopedAdminAccountDTO(a *service.Account, p adminaccess.Policy) gin.H {
 			}
 		}
 		result["credentials"] = gin.H{"model_mapping": mapping}
+		// 以下为非机密的状态字段，字段名与完整管理员接口的 dto.Account 一致。
+		var expiresAt *int64
+		if a.ExpiresAt != nil {
+			ts := a.ExpiresAt.Unix()
+			expiresAt = &ts
+		}
+		result["error_message"] = a.ErrorMessage
+		result["rate_limit_reset_at"] = a.RateLimitResetAt
+		result["overload_until"] = a.OverloadUntil
+		result["temp_unschedulable_until"] = a.TempUnschedulableUntil
+		result["proxy_id"] = a.ProxyID
+		result["expires_at"] = expiresAt
+		result["last_used_at"] = a.LastUsedAt
+		result["extra"] = scopedAdminAccountExtra(a.Extra)
+	}
+	return result
+}
+
+// 受限账户的 extra 只返回限速与 codex 额度键，其余键一律不返回。
+var scopedAdminExtraKeys = []string{
+	"base_rpm",
+	"codex_5h_used_percent", "codex_5h_reset_at", "codex_5h_reset_after_seconds",
+	"codex_7d_used_percent", "codex_7d_reset_at", "codex_7d_reset_after_seconds",
+}
+
+func scopedAdminAccountExtra(extra map[string]any) gin.H {
+	result := gin.H{}
+	for _, key := range scopedAdminExtraKeys {
+		if value, ok := extra[key]; ok {
+			result[key] = value
+		}
 	}
 	return result
 }
@@ -69,6 +100,15 @@ func (h *AccountHandler) ScopedAdminKeyAccounts(c *gin.Context) {
 	}
 	if path == base+"/import/codex-session" && c.Request.Method == "POST" {
 		h.scopedAdminImportCodexSession(c)
+		return
+	}
+	// 用量接口逐账户按 accounts.usage.read 验权，通过后才交给原处理函数。
+	if (path == base+"/today-stats/batch" || path == base+"/usage/batch") && c.Request.Method == "POST" {
+		h.scopedAdminBatchUsage(c, principal, path == base+"/usage/batch")
+		return
+	}
+	if path == base+"/:id/stats" && c.Request.Method == "GET" {
+		h.scopedAdminAccountStats(c, principal)
 		return
 	}
 	api, ok := h.adminService.(service.ScopedAdminAccounts)

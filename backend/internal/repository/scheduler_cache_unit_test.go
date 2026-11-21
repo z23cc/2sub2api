@@ -337,6 +337,11 @@ func TestMarshalSchedulerCacheAccountKeepsEncodingJSONWireFormat(t *testing.T) {
 	}
 }
 
+func TestBuildSchedulerMetadataAccount_KeepsCreationTime(t *testing.T) {
+	createdAt := time.Date(2026, time.November, 20, 12, 0, 0, 0, time.UTC)
+	require.Equal(t, createdAt, buildSchedulerMetadataAccount(service.Account{CreatedAt: createdAt}).CreatedAt)
+}
+
 func TestBuildSchedulerMetadataAccount_KeepsOpenAIWSFlags(t *testing.T) {
 	account := service.Account{
 		ID:       42,

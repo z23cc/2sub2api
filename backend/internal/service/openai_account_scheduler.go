@@ -2930,13 +2930,25 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 	}
 	priority := s.prioritySchedulingRuntimeConfig()
 	observation := priorityObservationFromContext(ctx, requestedModel)
+	strictAffinity := s.strictOpenAISessionAffinity(groupID, platform, requiredImageCapability)
+	agentRecoveryBound := openAIAgentRecoveryBound(ctx)
+	priorityRouting := platform == PlatformOpenAI && requiredImageCapability == "" && useUpstreamTokenCost &&
+		priorityApplies(priority, OpenAIAccountScheduleRequest{GroupID: groupID, RequestedModel: requestedModel, HistoryModel: observation.model})
+	oldestFirst := platform == PlatformOpenAI && requiredImageCapability == "" && !requireCompact && useUpstreamTokenCost &&
+		(requiredTransport == OpenAIUpstreamTransportAny || requiredTransport == OpenAIUpstreamTransportHTTPSSE) &&
+		strings.TrimSpace(previousResponseID) == "" && guardianParentAccountID == 0 && !preserveGuardianParentBinding &&
+		!strictAffinity && !agentRecoveryBound && !priorityRouting && ctx.Value(openAIEncryptedReasoningAffinityKey{}) != true &&
+		s.openAIOldestFirst(groupID)
 	var stickyAccountID int64
-	var stickyReadErr error
-	if sessionHash != "" && s.cache != nil {
-		stickyAccountID, stickyReadErr = s.getStickySessionAccountID(ctx, groupID, sessionHash)
+	var scheduler OpenAIAccountScheduler
+	if !oldestFirst {
+		var stickyReadErr error
+		if sessionHash != "" && s.cache != nil {
+			stickyAccountID, stickyReadErr = s.getStickySessionAccountID(ctx, groupID, sessionHash)
+		}
+		ctx = withOpenAIStickyBindingSnapshot(ctx, groupID, sessionHash, stickyAccountID, stickyReadErr == nil || errors.Is(stickyReadErr, ErrStickySessionNotFound))
+		scheduler = s.getOpenAIAccountScheduler(ctx, platform == PlatformQwen || strictAffinity || agentRecoveryBound || priorityRouting)
 	}
-	ctx = withOpenAIStickyBindingSnapshot(ctx, groupID, sessionHash, stickyAccountID, stickyReadErr == nil || errors.Is(stickyReadErr, ErrStickySessionNotFound))
-	scheduler := s.getOpenAIAccountScheduler(ctx, platform == PlatformQwen || s.strictOpenAISessionAffinity(groupID, platform, requiredImageCapability) || openAIAgentRecoveryBound(ctx) || (platform == PlatformOpenAI && requiredImageCapability == "" && useUpstreamTokenCost && priorityApplies(priority, OpenAIAccountScheduleRequest{GroupID: groupID, RequestedModel: requestedModel, HistoryModel: observation.model})))
 	if scheduler == nil {
 		decision.Layer = openAIAccountScheduleLayerLoadBalance
 		if selection, hit, err := s.selectLegacyAccountByPreviousResponse(ctx, groupID, previousResponseID, sessionHash, requestedModel, excludedIDs, requiredTransport, requiredCapability, requiredImageCapability, requireCompact, platform); err != nil {
@@ -3013,7 +3025,7 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 		if requiredTransport == OpenAIUpstreamTransportAny || requiredTransport == OpenAIUpstreamTransportHTTPSSE {
 			effectiveExcludedIDs := cloneExcludedAccountIDs(excludedIDs)
 			for {
-				selection, err := s.selectAccountWithLoadAwareness(ctx, groupID, platform, legacySessionHash, requestedModel, effectiveExcludedIDs, requireCompact, requiredCapability, useUpstreamTokenCost, acceptLegacyAccount)
+				selection, err := s.selectAccountWithLoadAwareness(ctx, groupID, platform, legacySessionHash, requestedModel, effectiveExcludedIDs, requireCompact, requiredCapability, useUpstreamTokenCost, oldestFirst, acceptLegacyAccount)
 				if err != nil {
 					return nil, decision, err
 				}
@@ -3039,7 +3051,7 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 
 		effectiveExcludedIDs := cloneExcludedAccountIDs(excludedIDs)
 		for {
-			selection, err := s.selectAccountWithLoadAwareness(ctx, groupID, platform, legacySessionHash, requestedModel, effectiveExcludedIDs, requireCompact, requiredCapability, useUpstreamTokenCost, acceptLegacyAccount)
+			selection, err := s.selectAccountWithLoadAwareness(ctx, groupID, platform, legacySessionHash, requestedModel, effectiveExcludedIDs, requireCompact, requiredCapability, useUpstreamTokenCost, false, acceptLegacyAccount)
 			if err != nil {
 				return nil, decision, err
 			}

@@ -966,6 +966,17 @@ func TestLoadSchedulingConfigFromEnv(t *testing.T) {
 	}
 }
 
+func TestLoadOpenAIOldestFirstGroups(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	configFile := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(configFile, []byte("gateway:\n  openai_scheduler:\n    oldest_first_group_ids: [2, 5]\n"), 0o600))
+	t.Setenv("CONFIG_FILE", configFile)
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.Equal(t, []int64{2, 5}, cfg.Gateway.OpenAIScheduler.OldestFirstGroupIDs)
+}
+
 func TestLoadWeChatConnectConfigFromLegacyEnv(t *testing.T) {
 	resetViperWithJWTSecret(t)
 	t.Setenv("WECHAT_OAUTH_OPEN_APP_ID", "wx-open-app")

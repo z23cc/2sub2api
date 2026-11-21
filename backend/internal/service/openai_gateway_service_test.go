@@ -1134,6 +1134,83 @@ func TestOpenAISelectAccountForModelWithExclusions_NoModelSupport(t *testing.T) 
 	}
 }
 
+func TestOpenAIAccountSelection_OldestFirstFillsAccountsInOrder(t *testing.T) {
+	groupID := int64(2)
+	otherGroupID := int64(3)
+	sessionHash := "existing-session"
+	addedAt := time.Date(2026, time.November, 20, 12, 0, 0, 0, time.UTC)
+	accounts := []Account{
+		{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: true, Concurrency: 2, Priority: 1, CreatedAt: addedAt.Add(time.Minute)},
+		{ID: 3, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: true, Concurrency: 2, Priority: 50, CreatedAt: addedAt},
+		{ID: 2, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: true, Concurrency: 2, Priority: 100, CreatedAt: addedAt},
+	}
+	for i := range accounts {
+		accounts[i].GroupIDs = []int64{groupID, otherGroupID}
+	}
+	cache := &stubGatewayCache{sessionBindings: map[string]int64{"openai:" + sessionHash: 1}}
+	slotAvailable := map[int64]bool{1: true, 2: true, 3: true}
+	cfg := &config.Config{}
+	cfg.Gateway.OpenAIScheduler.OldestFirstGroupIDs = []int64{groupID}
+	cfg.Gateway.Scheduling.LoadBatchEnabled = true
+	svc := &OpenAIGatewayService{
+		cfg:                cfg,
+		accountRepo:        stubOpenAIAccountRepo{accounts: accounts},
+		cache:              cache,
+		concurrencyService: NewConcurrencyService(stubConcurrencyCache{acquireResults: slotAvailable}),
+	}
+	selectAccount := func(groupID int64, excludedIDs map[int64]struct{}) *AccountSelectionResult {
+		t.Helper()
+		selection, _, err := svc.SelectAccountWithSchedulerForCapability(context.Background(), &groupID, "", sessionHash, "gpt-4", excludedIDs,
+			OpenAIUpstreamTransportAny, OpenAIEndpointCapabilityChatCompletions, false, false, true)
+		require.NoError(t, err)
+		require.NotNil(t, selection)
+		require.NotNil(t, selection.Account)
+		if selection.ReleaseFunc != nil {
+			selection.ReleaseFunc()
+		}
+		return selection
+	}
+
+	require.EqualValues(t, 2, selectAccount(groupID, nil).Account.ID)
+	slotAvailable[2] = false
+	require.EqualValues(t, 3, selectAccount(groupID, nil).Account.ID)
+	slotAvailable[3] = false
+	require.EqualValues(t, 1, selectAccount(groupID, nil).Account.ID)
+	slotAvailable[1] = false
+	waiting := selectAccount(groupID, nil)
+	require.NotNil(t, waiting.WaitPlan)
+	require.EqualValues(t, 2, waiting.WaitPlan.AccountID)
+	slotAvailable[2], slotAvailable[1] = true, true
+	require.EqualValues(t, 2, selectAccount(groupID, nil).Account.ID)
+	require.EqualValues(t, 1, selectAccount(groupID, map[int64]struct{}{2: {}}).Account.ID)
+	require.EqualValues(t, 1, selectAccount(otherGroupID, nil).Account.ID)
+
+	ctx := context.Background()
+	require.NoError(t, svc.getOpenAIWSStateStore().BindResponseAccount(ctx, groupID, "resp_existing", 1, time.Hour))
+	continuation, decision, err := svc.SelectAccountWithSchedulerForCapability(ctx, &groupID, "resp_existing", "", "gpt-4", nil,
+		OpenAIUpstreamTransportAny, OpenAIEndpointCapabilityResponses, false, false, true)
+	require.NoError(t, err)
+	require.NotNil(t, continuation)
+	require.NotNil(t, continuation.ReleaseFunc)
+	t.Cleanup(continuation.ReleaseFunc)
+	require.EqualValues(t, 1, continuation.Account.ID)
+	require.True(t, decision.StickyPreviousHit)
+}
+
+func TestOpenAIAccountSelection_OldestFirstRecoversDatesFromLegacySnapshot(t *testing.T) {
+	addedAt := time.Date(2026, time.November, 20, 12, 0, 0, 0, time.UTC)
+	cache := &schedulerBatchCacheStub{accounts: map[int64]*Account{5: {ID: 5, CreatedAt: addedAt}}}
+	svc := &OpenAIGatewayService{schedulerSnapshot: &SchedulerSnapshotService{cache: cache}}
+	candidates := []*Account{
+		{ID: 2, CreatedAt: addedAt.Add(time.Minute)},
+		{ID: 5},
+	}
+	require.NoError(t, svc.sortOpenAIAccountsOldestFirst(context.Background(), candidates))
+	require.EqualValues(t, 5, candidates[0].ID)
+	require.True(t, candidates[0].CreatedAt.IsZero())
+	require.Equal(t, [][]int64{{5}}, cache.batches)
+}
+
 func TestOpenAISelectAccountWithLoadAwareness_LoadBatchErrorFallback(t *testing.T) {
 	groupID := int64(1)
 	repo := stubOpenAIAccountRepo{

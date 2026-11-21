@@ -572,6 +572,9 @@ gateway:
     # 已绑定账号满载时等待，停用/失败时返回错误，不跨账号回退；需稳定 session_id/prompt_cache_key。
     # 绑定沿用 sticky_session_ttl_seconds；配置在所有处理该分组请求的节点保持一致。
     strict_session_affinity_group_ids: []
+    # 指定分组的普通 OpenAI HTTP 文本请求，按账号创建时间从早到晚尝试占用并发槽位。
+    # 普通会话绑定、账号优先级和负载排序让位给创建时间。续接归属、严格粘性及优先调度规则仍优先。
+    oldest_first_group_ids: []
     # 是否允许 session_hash sticky 在账号健康度恶化时临时逃逸；false 可一键回退旧行为
     sticky_escape_enabled: true
     # TTFT EWMA 超过该阈值（毫秒）时跳过 sticky，默认 15s，避免轻微抖动就逃逸

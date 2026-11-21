@@ -25,6 +25,9 @@ import (
 func TestScopedAdminAccountListScopesCountAndPageInSQL(t *testing.T) {
 	var countScope string
 	matcher := sqlmock.QueryMatcherFunc(func(expected, actual string) error {
+		if expected == "groups" {
+			return sqlmock.QueryMatcherRegexp.Match(`FROM "account_groups" WHERE "account_groups"."account_id" = \$1`, actual)
+		}
 		if !strings.Contains(actual, `"type"`) || !strings.Contains(actual, `"account_groups"`) || !strings.Contains(actual, " OR ") {
 			return fmt.Errorf("查询缺少完整规则: %s", actual)
 		}
@@ -40,6 +43,9 @@ func TestScopedAdminAccountListScopesCountAndPageInSQL(t *testing.T) {
 		} else {
 			if where != countScope {
 				return fmt.Errorf("分页和统计范围不同")
+			}
+			if !strings.Contains(actual, `"accounts"."proxy_id"`) {
+				return fmt.Errorf("账户列表查询缺少 proxy_id")
 			}
 			// 允许模型映射子字段投影，禁止读取完整 credentials。
 			projected := strings.ReplaceAll(actual, `"accounts"."credentials"->'model_mapping' AS model_mapping`, "model_mapping")
@@ -57,19 +63,21 @@ func TestScopedAdminAccountListScopesCountAndPageInSQL(t *testing.T) {
 	client := dbent.NewClient(dbent.Driver(entsql.OpenDB(dialect.Postgres, db)))
 	defer client.Close()
 	repo := newAccountRepositoryWithSQL(client, db, nil)
-	mock.ExpectQuery("count").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
-	mock.ExpectQuery("page").WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	mock.ExpectQuery("count").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(2))
+	mock.ExpectQuery("page").WillReturnRows(sqlmock.NewRows([]string{"id", "proxy_id"}).AddRow(1, 12).AddRow(2, nil))
+	mock.ExpectQuery("groups").WithArgs(1).WillReturnRows(sqlmock.NewRows([]string{"group_id"}).AddRow(1))
+	mock.ExpectQuery("groups").WithArgs(2).WillReturnRows(sqlmock.NewRows([]string{"group_id"}).AddRow(2))
 	principal := &adminaccess.Principal{Policy: adminaccess.Policy{Rules: []adminaccess.Rule{
 		{Permissions: []string{"accounts.read"}, GroupIDs: []int64{1}, AccountTypes: []string{"oauth"}},
 		{Permissions: []string{"accounts.read"}, GroupIDs: []int64{2}, AccountTypes: []string{"apikey"}},
 	}}}
-	_, total, err := repo.ScopedAdminList(adminaccess.WithPrincipal(context.Background(), principal), pagination.PaginationParams{Page: 1, PageSize: 20}, "", "", "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if total != 0 {
-		t.Fatal(total)
-	}
+	rows, total, err := repo.ScopedAdminList(adminaccess.WithPrincipal(context.Background(), principal), pagination.PaginationParams{Page: 1, PageSize: 20}, "", "", "", "")
+	require.NoError(t, err)
+	require.EqualValues(t, 2, total)
+	require.Len(t, rows, 2)
+	require.NotNil(t, rows[0].ProxyID)
+	require.EqualValues(t, 12, *rows[0].ProxyID)
+	require.Nil(t, rows[1].ProxyID)
 	if err = mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
 	}
@@ -97,12 +105,14 @@ func TestScopedAdminAccountListPostgresRulesAndPagination(t *testing.T) {
 	_, err = db.Exec(`CREATE TABLE accounts (
 		id BIGINT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', notes TEXT, platform TEXT NOT NULL,
 		type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', schedulable BOOLEAN NOT NULL DEFAULT true,
-		concurrency INT NOT NULL DEFAULT 1, priority INT NOT NULL DEFAULT 1, credentials JSONB DEFAULT '{}', deleted_at TIMESTAMPTZ
+		concurrency INT NOT NULL DEFAULT 1, priority INT NOT NULL DEFAULT 1, proxy_id BIGINT,
+		credentials JSONB DEFAULT '{}', deleted_at TIMESTAMPTZ
 	);
 	CREATE TABLE account_groups(account_id BIGINT, group_id BIGINT, priority INT DEFAULT 50, allowed_models JSONB, created_at TIMESTAMPTZ DEFAULT NOW());
 	INSERT INTO accounts(id,platform,type) VALUES
 	(1,'openai','oauth'), (2,'openai','apikey'), (3,'openai','oauth'),
 	(4,'openai','apikey'), (5,'anthropic','oauth'), (6,'openai','oauth');
+	UPDATE accounts SET proxy_id=12 WHERE id=1;
 	INSERT INTO account_groups(account_id,group_id) VALUES (1,1),(1,2),(2,1),(3,2),(4,2),(5,1);`)
 	require.NoError(t, err)
 	_, err = db.Exec(`UPDATE accounts SET credentials = '{"model_mapping":{"alias":"target","invalid":{"token":"NESTED_SECRET"}},"access_token":"TOKEN_SECRET","refresh_token":"REFRESH_SECRET","api_key":"KEY_SECRET","base_url":"URL_SECRET"}' WHERE id=1`)
@@ -120,8 +130,11 @@ func TestScopedAdminAccountListPostgresRulesAndPagination(t *testing.T) {
 		require.Len(t, rows, 1)
 		require.Equal(t, wantID, rows[0].ID)
 		if wantID == 1 {
+			require.NotNil(t, rows[0].ProxyID)
+			require.EqualValues(t, 12, *rows[0].ProxyID)
 			require.Equal(t, map[string]any{"model_mapping": map[string]string{"alias": "target"}}, rows[0].Credentials)
 		} else {
+			require.Nil(t, rows[0].ProxyID)
 			require.Empty(t, rows[0].Credentials)
 		}
 	}

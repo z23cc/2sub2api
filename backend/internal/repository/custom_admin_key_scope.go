@@ -42,10 +42,11 @@ func (r *accountRepository) ScopedAdminList(ctx context.Context, p pagination.Pa
 		Schedulable  bool
 		Concurrency  int
 		Priority     int
+		ProxyID      *int64          `json:"proxy_id"`
 		ModelMapping json.RawMessage `json:"model_mapping"`
 	}
 	err = q.Offset(p.Offset()).Limit(p.Limit()).Order(dbaccount.ByID()).
-		Select(dbaccount.FieldID, dbaccount.FieldName, dbaccount.FieldNotes, dbaccount.FieldPlatform, dbaccount.FieldType, dbaccount.FieldStatus, dbaccount.FieldSchedulable, dbaccount.FieldConcurrency, dbaccount.FieldPriority).
+		Select(dbaccount.FieldID, dbaccount.FieldName, dbaccount.FieldNotes, dbaccount.FieldPlatform, dbaccount.FieldType, dbaccount.FieldStatus, dbaccount.FieldSchedulable, dbaccount.FieldConcurrency, dbaccount.FieldPriority, dbaccount.FieldProxyID).
 		Aggregate(func(s *entsql.Selector) string {
 			return s.C(dbaccount.FieldCredentials) + "->'model_mapping' AS model_mapping"
 		}).Scan(ctx, &rows)
@@ -71,7 +72,11 @@ func (r *accountRepository) ScopedAdminList(ctx context.Context, p pagination.Pa
 		if len(mapping) > 0 {
 			credentials = map[string]any{"model_mapping": mapping}
 		}
-		accounts = append(accounts, service.Account{ID: row.ID, Name: row.Name, Notes: row.Notes, Platform: row.Platform, Type: row.Type, Status: row.Status, Schedulable: row.Schedulable, Concurrency: row.Concurrency, Priority: row.Priority, GroupIDs: groups, Credentials: credentials})
+		accounts = append(accounts, service.Account{
+			ID: row.ID, Name: row.Name, Notes: row.Notes, Platform: row.Platform, Type: row.Type,
+			Status: row.Status, Schedulable: row.Schedulable, Concurrency: row.Concurrency, Priority: row.Priority,
+			ProxyID: row.ProxyID, GroupIDs: groups, Credentials: credentials,
+		})
 	}
 	return accounts, int64(total), nil
 }

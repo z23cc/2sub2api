@@ -73,7 +73,7 @@ vi.mock('vue-i18n', async () => {
   return {
     ...actual,
     useI18n: () => ({
-      t: (key: string) => key
+      t: (key: string, values?: { time?: string }) => values?.time ? `${key} ${values.time}` : key
     })
   }
 })
@@ -99,6 +99,7 @@ const ProbeDataTableStub = {
       <div v-if="loading" data-test="table-loading">loading</div>
       <div v-for="row in loading ? [] : data" :key="row.id" :data-account-id="row.id">
         <div data-test="select-row"><slot name="cell-select" :row="row" /></div>
+        <slot name="cell-created_at" :value="row.created_at" :row="row" />
         <div data-test="account-rate"><slot name="cell-rate_multiplier" :row="row" /></div>
         <span data-test="account-cost">{{ row.extra?.cost_multiplier }}</span>
         <slot name="cell-upstream_billing_rate" :row="row" />
@@ -449,6 +450,41 @@ describe('admin AccountsView bulk edit scope', () => {
       label: 'admin.accounts.columns.createdAt',
       sortable: true
     })
+  })
+
+  it('counts down from account creation, highlights the last five minutes, and stops at zero', async () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] })
+    vi.setSystemTime(new Date('2026-11-20T12:00:00Z'))
+    const page = probePage([1, 2, 3, 4])
+    const createdAt = ['2026-11-20T10:05:00Z', '2026-11-20T10:00:02Z', '2026-11-20T09:59:59Z', '']
+    page.items.forEach((account, index) => { account.created_at = createdAt[index] })
+    listAccounts.mockResolvedValue(page)
+    const wrapper = mountProbeView()
+
+    try {
+      await flushPromises()
+      const countdown = (id: number) => wrapper.find(`[data-account-id="${id}"] [data-test="account-added-countdown"]`)
+      expect(countdown(1).text()).toBe('admin.accounts.addedCountdown.remaining 00:05:00')
+      expect(countdown(1).classes()).not.toContain('text-amber-800')
+      expect(countdown(2).text()).toBe('admin.accounts.addedCountdown.remaining 00:00:02')
+      expect(countdown(2).classes()).toContain('text-amber-800')
+      expect(countdown(3).text()).toBe('admin.accounts.addedCountdown.elapsed')
+      expect(countdown(3).classes()).not.toContain('text-amber-800')
+      expect(countdown(4).exists()).toBe(false)
+
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(countdown(1).text()).toBe('admin.accounts.addedCountdown.remaining 00:04:59')
+      expect(countdown(1).classes()).toContain('text-amber-800')
+      expect(countdown(2).text()).toBe('admin.accounts.addedCountdown.remaining 00:00:01')
+
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(countdown(2).text()).toBe('admin.accounts.addedCountdown.elapsed')
+      expect(countdown(2).classes()).not.toContain('text-amber-800')
+      expect(listAccounts).toHaveBeenCalledTimes(1)
+    } finally {
+      wrapper.unmount()
+      vi.useRealTimers()
+    }
   })
 
   it('passes the loaded global probe state to every upstream billing cell', async () => {

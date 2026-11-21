@@ -470,8 +470,22 @@
           <template #cell-last_used_at="{ value }">
             <span class="text-sm text-gray-500 dark:text-dark-400">{{ formatRelativeTime(value) }}</span>
           </template>
-          <template #cell-created_at="{ value }">
-            <span class="whitespace-nowrap text-sm tabular-nums text-gray-500 dark:text-dark-400">{{ formatDateTime(value) }}</span>
+          <template #cell-created_at="{ row, value }">
+            <div class="whitespace-nowrap tabular-nums">
+              <div class="text-sm text-gray-500 dark:text-dark-400">{{ formatDateTime(value) }}</div>
+              <div
+                v-if="accountAddedCountdowns.has(row.id)"
+                class="mt-0.5 text-xs"
+                :class="accountAddedCountdowns.get(row.id)?.endingSoon
+                  ? 'font-medium text-amber-800 dark:text-amber-300'
+                  : 'text-gray-500 dark:text-dark-400'"
+                data-test="account-added-countdown"
+              >
+                {{ accountAddedCountdowns.get(row.id)?.remaining
+                  ? t('admin.accounts.addedCountdown.remaining', { time: accountAddedCountdowns.get(row.id)?.remaining })
+                  : t('admin.accounts.addedCountdown.elapsed') }}
+              </div>
+            </div>
           </template>
           <template #cell-expires_at="{ row, value }">
             <div class="flex flex-col items-start gap-1">
@@ -1292,6 +1306,46 @@ const {
     sort_by: sortState.sort_by,
     sort_order: sortState.sort_order
   }
+})
+
+const accountAddedNow = ref(Date.now())
+const accountAddedDeadlines = computed(() => {
+  const deadlines = new Map<number, number>()
+  if (isColumnVisible('created_at')) {
+    for (const account of accounts.value) {
+      const addedAt = Date.parse(account.created_at)
+      if (Number.isFinite(addedAt)) deadlines.set(account.id, addedAt + 2 * 60 * 60 * 1000)
+    }
+  }
+  return deadlines
+})
+const latestAddedDeadline = computed(() => Math.max(0, ...accountAddedDeadlines.value.values()))
+const { pause: pauseAddedCountdown, resume: resumeAddedCountdown } = useIntervalFn(() => {
+  accountAddedNow.value = Date.now()
+  if (accountAddedNow.value >= latestAddedDeadline.value) pauseAddedCountdown()
+}, 1000, { immediate: false })
+
+watch(latestAddedDeadline, deadline => {
+  accountAddedNow.value = Date.now()
+  if (deadline > accountAddedNow.value) {
+    resumeAddedCountdown()
+  } else {
+    pauseAddedCountdown()
+  }
+}, { immediate: true })
+
+const accountAddedCountdowns = computed(() => {
+  const countdowns = new Map<number, { remaining: string; endingSoon: boolean }>()
+  for (const [id, deadline] of accountAddedDeadlines.value) {
+    const remainingMs = deadline - accountAddedNow.value
+    const seconds = Math.max(0, Math.ceil(remainingMs / 1000))
+    const remaining = seconds > 0
+      ? [Math.floor(seconds / 3600), Math.floor(seconds / 60) % 60, seconds % 60]
+        .map(part => String(part).padStart(2, '0')).join(':')
+      : ''
+    countdowns.set(id, { remaining, endingSoon: remainingMs > 0 && remainingMs < 5 * 60 * 1000 })
+  }
+  return countdowns
 })
 
 const {

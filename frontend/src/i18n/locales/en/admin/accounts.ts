@@ -397,6 +397,10 @@ export default {
         actions: 'Actions'
       },
       capacitySortHint: 'Sorts all filtered accounts by current concurrency (the numerator), independent of limits or utilization. Ties follow account ID order. Each refresh reads and sorts again, so accounts may move between pages. If the read fails, previous results remain; retry or choose another sort order.',
+      addedCountdown: {
+        remaining: '2-hour mark in {time}',
+        elapsed: '2 hours elapsed'
+      },
       schedulerScore: {
         baseShort: 'Base',
         stickyShort: 'Sticky',

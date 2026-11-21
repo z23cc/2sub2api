@@ -392,7 +392,7 @@ export default {
         usageWindows: 'Usage Windows',
         proxy: 'Proxy',
         lastUsed: 'Last Used',
-        createdAt: 'Created',
+        createdAt: 'Added at',
         expiresAt: 'Expires At',
         actions: 'Actions'
       },

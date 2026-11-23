@@ -1064,6 +1064,8 @@ func TestAPIContracts(t *testing.T) {
 					"model_plaza_enabled": false,
 					"model_plaza_require_auth": false,
 					"model_plaza_description": "",
+					"model_plaza_usd_to_cny_rate": 7,
+					"model_plaza_currency": {"wallet_currency":"USD","wallet_unit_value":1,"customer_currency":"USD","official_currency":"USD","official_platform_currencies":{},"official_model_currencies":{}},
 					"plugin_management_enabled": false,
 					"support_ticket_enabled": false,
 					"support_ticket_config": {
@@ -1440,6 +1442,8 @@ func TestAPIContracts(t *testing.T) {
 					"model_plaza_enabled": false,
 					"model_plaza_require_auth": false,
 					"model_plaza_description": "",
+					"model_plaza_usd_to_cny_rate": 7,
+					"model_plaza_currency": {"wallet_currency":"USD","wallet_unit_value":1,"customer_currency":"USD","official_currency":"USD","official_platform_currencies":{},"official_model_currencies":{}},
 					"plugin_management_enabled": false,
 					"support_ticket_enabled": false,
 					"support_ticket_config": {
@@ -1621,7 +1625,7 @@ func newContractDeps(t *testing.T) *contractDeps {
 	settingRepo := newStubSettingRepo()
 	settingService := service.NewSettingService(settingRepo, cfg)
 
-	adminService := service.NewAdminService(nil, userRepo, groupRepo, &accountRepo, proxyRepo, apiKeyRepo, redeemRepo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	adminService := service.NewAdminService(nil, userRepo, groupRepo, &accountRepo, proxyRepo, apiKeyRepo, redeemRepo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	authHandler := handler.NewAuthHandler(cfg, nil, userService, settingService, nil, redeemService, nil, nil)
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeyService)
 	usageHandler := handler.NewUsageHandler(usageService, apiKeyService, nil, nil)

@@ -23,9 +23,12 @@ describe('NewFeatureBadge', () => {
 
 
   it.each([
+    ['cross-platform gateway accounts', NEW_FEATURE_NOTICES.crossPlatformGatewayAccounts],
+    ['model plaza currency', NEW_FEATURE_NOTICES.modelPlazaCurrency],
     ['image usage billing', NEW_FEATURE_NOTICES.imageUsageBilling],
     ['channel UltraFast pricing', NEW_FEATURE_NOTICES.channelUltrafastPricing],
     ['user live load', NEW_FEATURE_NOTICES.userLiveLoad],
+    ['usage records API', NEW_FEATURE_NOTICES.usageRecordsApi],
     ['Free UltraFast', NEW_FEATURE_NOTICES.groupFreeUltrafast],
     ['force UltraFast', NEW_FEATURE_NOTICES.groupForceUltrafast],
     ['passthrough model filter', NEW_FEATURE_NOTICES.passthroughModelFilter],
@@ -37,10 +40,12 @@ describe('NewFeatureBadge', () => {
     ['QQ community', NEW_FEATURE_NOTICES.qqCommunity],
     ['QQ reward coupons', NEW_FEATURE_NOTICES.qqRewardCoupons],
     ['moderation upstream scope', NEW_FEATURE_NOTICES.moderationUpstreamAccountScope],
+    ['admin error platform', NEW_FEATURE_NOTICES.adminErrorPlatform],
     ['admin usage platform', NEW_FEATURE_NOTICES.adminUsagePlatform],
     ['user ID copy', NEW_FEATURE_NOTICES.userIdCopy],
     ['Antigravity usage query', NEW_FEATURE_NOTICES.antigravityUsageQuery],
     ['account operations multiple recipients', NEW_FEATURE_NOTICES.accountOpsMultipleEmails],
+    ['channel wallet and official account overview', NEW_FEATURE_NOTICES.channelBalanceOverview],
     ['account operations provider balance', NEW_FEATURE_NOTICES.accountOpsProviderBalance],
     ['account operations OAuth lifecycle', NEW_FEATURE_NOTICES.accountOpsOAuthLifecycle],
     ['account balance notification', NEW_FEATURE_NOTICES.accountOpsBalanceNotification],

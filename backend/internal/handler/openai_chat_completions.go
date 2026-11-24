@@ -105,7 +105,13 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		return
 	}
 	if service.IsGPTImageGenerationModel(reqModel) {
-		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "This model is not supported on the Chat Completions endpoint")
+		if !chatImagesPlatformSupported(c, apiKey) {
+			h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "This model is not supported on the Chat Completions endpoint")
+			return
+		}
+		// Images does its own security audit, image slot, user slot, billing
+		// checks and usage record, so none of them is taken here.
+		h.chatCompletionsImages(c, reqLog, body, reqModel, reqStream, &streamStarted)
 		return
 	}
 

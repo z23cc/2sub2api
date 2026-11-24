@@ -239,34 +239,73 @@ func (h *AsyncImageHandler) run(taskID, platform string, taskCtx *gin.Context, r
 	}()
 
 	h.execute(platform, taskCtx)
-	body := bytes.TrimSpace(recorder.Body.Bytes())
-	if err := taskCtx.Request.Context().Err(); err != nil && len(body) == 0 {
+	outcome := readInternalImageOutcome(taskCtx, recorder)
+	switch {
+	case outcome.ContextDone:
 		h.failTask(taskID, http.StatusGatewayTimeout, imageTaskErrorPayload("timeout_error", "image generation task timed out"))
-		return
+	case outcome.Succeeded():
+		if err := h.tasks.Complete(context.Background(), taskID, outcome.StatusCode, json.RawMessage(outcome.Body)); err != nil {
+			logger.L().Error("image_task.complete_store_failed", zap.String("task_id", taskID), zap.Error(err))
+		}
+	default:
+		h.failTask(taskID, outcome.StatusCode, outcome.ErrorObject())
 	}
-	// JSON whitespace keepalives may commit 200 before a local policy denial.
-	// The worker's semantic result is independent of that transport status.
-	if status, ok := taskCtx.Get(upstreamAuditFailureStatusKey); ok {
+}
+
+// internalImageOutcome is the result of running an Images handler on a
+// recorder, interpreted the same way for async tasks and Chat image replies.
+type internalImageOutcome struct {
+	// ContextDone reports that the execution context ended before anything
+	// was written. Async tasks treat it as a timeout; Chat as a client gone.
+	ContextDone bool
+	// StatusCode is the semantic status. It prefers the local-failure status
+	// over the recorder's, because JSON whitespace keepalives may commit 200
+	// before a local policy denial.
+	StatusCode int
+	// Body is the trimmed response body.
+	Body []byte
+	// InvalidSuccess reports a 2xx response whose body is empty or not JSON.
+	InvalidSuccess bool
+}
+
+func readInternalImageOutcome(inner *gin.Context, recorder *httptest.ResponseRecorder) internalImageOutcome {
+	body := bytes.TrimSpace(recorder.Body.Bytes())
+	if err := inner.Request.Context().Err(); err != nil && len(body) == 0 {
+		return internalImageOutcome{ContextDone: true, StatusCode: http.StatusGatewayTimeout}
+	}
+	if status, ok := inner.Get(upstreamAuditFailureStatusKey); ok {
 		if code, ok := status.(int); ok && code >= 400 {
-			h.failTask(taskID, code, extractImageTaskError(body))
-			return
+			return internalImageOutcome{StatusCode: code, Body: body}
 		}
 	}
 	statusCode := recorder.Code
 	if statusCode == 0 {
 		statusCode = http.StatusOK
 	}
-	if statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices {
-		if len(body) == 0 || !json.Valid(body) {
-			h.failTask(taskID, http.StatusBadGateway, imageTaskErrorPayload("api_error", "upstream returned an invalid image response"))
-			return
-		}
-		if err := h.tasks.Complete(context.Background(), taskID, statusCode, json.RawMessage(body)); err != nil {
-			logger.L().Error("image_task.complete_store_failed", zap.String("task_id", taskID), zap.Error(err))
-		}
-		return
+	outcome := internalImageOutcome{StatusCode: statusCode, Body: body}
+	if outcome.is2xx() && (len(body) == 0 || !json.Valid(body)) {
+		outcome.StatusCode = http.StatusBadGateway
+		outcome.InvalidSuccess = true
 	}
-	h.failTask(taskID, statusCode, extractImageTaskError(body))
+	return outcome
+}
+
+func (o internalImageOutcome) is2xx() bool {
+	return o.StatusCode >= http.StatusOK && o.StatusCode < http.StatusMultipleChoices
+}
+
+// Succeeded reports a 2xx response with a JSON body.
+func (o internalImageOutcome) Succeeded() bool {
+	return !o.ContextDone && !o.InvalidSuccess && o.is2xx()
+}
+
+// ErrorObject returns the OpenAI error object ({type, code, message}) of a
+// failed outcome.
+func (o internalImageOutcome) ErrorObject() json.RawMessage {
+	if o.InvalidSuccess {
+		return imageTaskErrorPayload("api_error", "upstream returned an invalid image response")
+	}
+	return extractImageTaskError(o.Body)
 }
 
 func (h *AsyncImageHandler) failTask(taskID string, statusCode int, taskErr json.RawMessage) {
@@ -288,20 +327,28 @@ func newAsyncImageContext(c *gin.Context, body []byte, timeoutDuration time.Dura
 		cancelExecution()
 		releaseBody()
 	}
-	request := c.Request.Clone(executionCtx)
+	taskCtx, recorder := newInternalImageContext(c, executionCtx, strings.TrimSuffix(c.Request.URL.Path, "/async"), body)
+	return taskCtx, recorder, cancel, nil
+}
+
+// newInternalImageContext copies c into a context that runs an Images handler
+// on body at path, under ctx, and records the response instead of writing it
+// to the client. The copy keeps c's keys, including the inbound endpoint.
+func newInternalImageContext(c *gin.Context, ctx context.Context, path string, body []byte) (*gin.Context, *httptest.ResponseRecorder) {
+	request := c.Request.Clone(ctx)
 	request.Body = pkghttputil.NewPrereadBody(body)
 	request.GetBody = func() (io.ReadCloser, error) {
 		return pkghttputil.NewPrereadBody(body), nil
 	}
 	request.ContentLength = int64(len(body))
-	request.URL.Path = strings.TrimSuffix(request.URL.Path, "/async")
+	request.URL.Path = path
 
-	taskCtx := c.Copy()
+	inner := c.Copy()
 	recorder := httptest.NewRecorder()
 	recorderCtx, _ := gin.CreateTestContext(recorder)
-	taskCtx.Writer = recorderCtx.Writer
-	taskCtx.Request = request
-	return taskCtx, recorder, cancel, nil
+	inner.Writer = recorderCtx.Writer
+	inner.Request = request
+	return inner, recorder
 }
 
 func asyncImageRequestStreams(contentType string, body []byte) bool {

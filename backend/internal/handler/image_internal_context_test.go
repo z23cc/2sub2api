@@ -70,7 +70,7 @@ func TestReadInternalImageOutcome(t *testing.T) {
 	}
 }
 
-func TestInternalImageContexts_CancellationAndRequestPath(t *testing.T) {
+func TestInternalImageContexts_AsyncPathAndCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	outer, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -82,11 +82,24 @@ func TestInternalImageContexts_CancellationAndRequestPath(t *testing.T) {
 	require.NoError(t, err)
 	defer cancelTask()
 	require.Equal(t, "/v1/images/generations", task.Request.URL.Path)
-
-	chat, _ := newInternalImageContext(outer, ctx, "/v1/images/edits", body)
-	require.Equal(t, "/v1/images/edits", chat.Request.URL.Path)
 	require.Equal(t, "/v1/images/generations/async", outer.Request.URL.Path)
-	require.Equal(t, EndpointImagesGenerations, GetInboundEndpoint(chat))
+
+	cancel()
+	require.NoError(t, task.Request.Context().Err())
+	cancelTask()
+	require.ErrorIs(t, task.Request.Context().Err(), context.Canceled)
+}
+
+func TestInternalImageContexts_ChatEditPathAndBody(t *testing.T) {
+	outer, _ := gin.CreateTestContext(httptest.NewRecorder())
+	outer.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	outer.Set(ctxKeyInboundEndpoint, EndpointChatCompletions)
+	body := []byte(`{"model":"gpt-image-1","prompt":"Add stripes","images":[{"image_url":"https://example.com/cat.png"}]}`)
+
+	chat, _ := newInternalImageContext(outer, outer.Request.Context(), "/v1/images/edits", body)
+	require.Equal(t, "/v1/images/edits", chat.Request.URL.Path)
+	require.Equal(t, "/v1/chat/completions", outer.Request.URL.Path)
+	require.Equal(t, EndpointChatCompletions, GetInboundEndpoint(chat))
 	require.Equal(t, int64(len(body)), chat.Request.ContentLength)
 	replay, err := chat.Request.GetBody()
 	require.NoError(t, err)
@@ -94,10 +107,4 @@ func TestInternalImageContexts_CancellationAndRequestPath(t *testing.T) {
 	gotBody, err := io.ReadAll(replay)
 	require.NoError(t, err)
 	require.Equal(t, body, gotBody)
-
-	cancel()
-	require.ErrorIs(t, chat.Request.Context().Err(), context.Canceled)
-	require.NoError(t, task.Request.Context().Err())
-	cancelTask()
-	require.ErrorIs(t, task.Request.Context().Err(), context.Canceled)
 }

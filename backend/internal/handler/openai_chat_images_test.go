@@ -42,10 +42,11 @@ type chatImageUpstreamCall struct {
 
 type chatImageUpstream struct {
 	service.HTTPUpstream
-	status int
-	body   string
-	wait   <-chan struct{}
-	calls  []chatImageUpstreamCall
+	status         int
+	body           string
+	wait           <-chan struct{}
+	calls          []chatImageUpstreamCall
+	beforeResponse func(*http.Request) error
 }
 
 func (u *chatImageUpstream) Do(req *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
@@ -63,6 +64,11 @@ func (u *chatImageUpstream) Do(req *http.Request, _ string, _ int64, _ int) (*ht
 			return nil, req.Context().Err()
 		case <-timer.C:
 			return nil, errors.New("waiting for SSE keepalive timed out")
+		}
+	}
+	if u.beforeResponse != nil {
+		if err := u.beforeResponse(req); err != nil {
+			return nil, err
 		}
 	}
 	return &http.Response{
@@ -719,8 +725,14 @@ func TestOpenAIChatImages_EmptyBilledResult(t *testing.T) {
 	}
 }
 
+const (
+	chatImageBillingDirectBody = `{"model":"gpt-image-1","n":2,"prompt":"Draw a cat","size":"1024x1024","stream":false}`
+	chatImageBillingChatBody   = `{"model":"gpt-image-1","n":2,"size":"1024x1024","stream":%t,` + chatImageMessage + `}`
+	chatImageBillingResult     = `{"created":1,"data":[{"b64_json":"aGk="},{"b64_json":"eWVz"}],"usage":{"input_tokens":5,"output_tokens":10,"total_tokens":15}}`
+)
+
 func TestOpenAIChatImages_BillingMatchesDirectImages(t *testing.T) {
-	upstream := &chatImageUpstream{status: http.StatusOK, body: `{"created":1,"data":[{"b64_json":"aGk="},{"b64_json":"eWVz"}],"usage":{"input_tokens":5,"output_tokens":10,"total_tokens":15}}`}
+	upstream := &chatImageUpstream{status: http.StatusOK, body: chatImageBillingResult}
 	cfg := &config.Config{RunMode: config.RunModeStandard}
 	logs := &chatImageUsageLogs{}
 	billing := &compatStreamUsageBillingRepo{}
@@ -728,8 +740,6 @@ func TestOpenAIChatImages_BillingMatchesDirectImages(t *testing.T) {
 	apiKey.Group.ImageCountBilling = true
 	pricePerImage := 0.125
 	apiKey.Group.ImagePrice1K = &pricePerImage
-	const directBody = `{"model":"gpt-image-1","n":2,"prompt":"Draw a cat","size":"1024x1024","stream":false}`
-	const chatBody = `{"model":"gpt-image-1","n":2,"size":"1024x1024","stream":%t,` + chatImageMessage + `}`
 
 	for i, tt := range []struct {
 		path        string
@@ -738,9 +748,9 @@ func TestOpenAIChatImages_BillingMatchesDirectImages(t *testing.T) {
 		stream      bool
 		serve       gin.HandlerFunc
 	}{
-		{"/v1/images/generations", directBody, "/v1/images/generations", false, h.Images},
-		{"/v1/chat/completions", fmt.Sprintf(chatBody, false), "/v1/chat/completions", false, h.ChatCompletions},
-		{"/chat/completions", fmt.Sprintf(chatBody, true), "/chat/completions", true, h.ChatCompletions},
+		{"/v1/images/generations", chatImageBillingDirectBody, "/v1/images/generations", false, h.Images},
+		{"/v1/chat/completions", fmt.Sprintf(chatImageBillingChatBody, false), "/v1/chat/completions", false, h.ChatCompletions},
+		{"/chat/completions", fmt.Sprintf(chatImageBillingChatBody, true), "/chat/completions", true, h.ChatCompletions},
 	} {
 		rec := httptest.NewRecorder()
 		c := newChatImageContext(rec, apiKey, tt.path, tt.body)
@@ -752,7 +762,7 @@ func TestOpenAIChatImages_BillingMatchesDirectImages(t *testing.T) {
 		require.Len(t, logs.rows, i+1, "%s should write exactly one usage row", tt.path)
 		require.Len(t, billing.commands, i+1, "%s should submit exactly one billing command", tt.path)
 		require.Len(t, upstream.calls, i+1)
-		require.Equal(t, chatImageUpstreamCall{path: "/v1/images/generations", body: directBody}, upstream.calls[i])
+		require.Equal(t, chatImageUpstreamCall{path: "/v1/images/generations", body: chatImageBillingDirectBody}, upstream.calls[i])
 		row := logs.rows[i]
 		require.Equal(t, &tt.wantInbound, row.InboundEndpoint)
 		upstreamEndpoint := "/v1/images/generations"
@@ -767,7 +777,7 @@ func TestOpenAIChatImages_BillingMatchesDirectImages(t *testing.T) {
 		require.Equal(t, 2*pricePerImage, row.TotalCost)
 		require.Equal(t, 2*pricePerImage, row.ActualCost)
 		command := billing.commands[i]
-		require.Equal(t, service.HashUsageRequestPayload([]byte(directBody)), command.RequestPayloadHash)
+		require.Equal(t, service.HashUsageRequestPayload([]byte(chatImageBillingDirectBody)), command.RequestPayloadHash)
 		require.Equal(t, 2*pricePerImage, command.BalanceCost)
 		if i > 0 {
 			direct := logs.rows[0]
@@ -778,6 +788,78 @@ func TestOpenAIChatImages_BillingMatchesDirectImages(t *testing.T) {
 			row.QueueTiming, row.ContentTiming = direct.QueueTiming, direct.ContentTiming
 			require.Equal(t, direct, row, "usage row differs for %s", tt.path)
 		}
+	}
+}
+
+func TestOpenAIChatImages_ClientDisconnectStillBills(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		stream bool
+	}{
+		{name: "non_streaming"},
+		{name: "streaming", stream: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			upstream := &chatImageUpstream{status: http.StatusOK, body: chatImageBillingResult}
+			logs := &chatImageUsageLogs{}
+			billing := &compatStreamUsageBillingRepo{}
+			cfg := &config.Config{RunMode: config.RunModeStandard}
+			h, apiKey := newChatImageHandler(t, cfg, upstream, chatImageBillingCache{newHandlerInflightCache(100)}, logs, billing)
+			pricePerImage := 0.125
+			apiKey.Group.ImageCountBilling = true
+			apiKey.Group.ImagePrice1K = &pricePerImage
+			storage := &chatImageStorage{}
+			h.imageStorageResolver = func() (*service.ImageResultUploader, bool) {
+				return service.NewImageResultUploader(storage, "images/", 1024, nil), true
+			}
+
+			direct := httptest.NewRecorder()
+			h.Images(newChatImageContext(direct, apiKey, "/v1/images/generations", chatImageBillingDirectBody))
+			require.Equal(t, http.StatusOK, direct.Code, direct.Body.String())
+			require.Len(t, upstream.calls, 1)
+			require.Len(t, logs.rows, 1)
+			require.Len(t, billing.commands, 1)
+			require.Equal(t, 2*pricePerImage, billing.commands[0].BalanceCost)
+
+			rec := httptest.NewRecorder()
+			c := newChatImageContext(rec, apiKey, "/v1/chat/completions", fmt.Sprintf(chatImageBillingChatBody, tt.stream))
+			clientCtx, cancel := context.WithCancel(c.Request.Context())
+			defer cancel()
+			c.Request = c.Request.WithContext(clientCtx)
+			var transportErr error
+			upstream.beforeResponse = func(req *http.Request) error {
+				cancel()
+				transportErr = req.Context().Err()
+				return transportErr
+			}
+
+			require.NotPanics(t, func() { h.ChatCompletions(c) })
+
+			require.ErrorIs(t, clientCtx.Err(), context.Canceled, "the client must disconnect inside the upstream call")
+			require.NoError(t, transportErr, "the in-flight upstream request must survive client cancellation")
+			require.Len(t, upstream.calls, 2, "one upstream call for each request")
+			require.Equal(t, chatImageUpstreamCall{path: "/v1/images/generations", body: chatImageBillingDirectBody}, upstream.calls[1])
+			require.Len(t, logs.rows, 2, "one usage row for each request")
+			require.Len(t, billing.commands, 2, "one settlement for each request")
+			require.Equal(t, 2, logs.rows[1].ImageCount)
+			require.Equal(t, logs.rows[0].ActualCost, logs.rows[1].ActualCost)
+			require.Equal(t, billing.commands[0].BalanceCost, billing.commands[1].BalanceCost)
+			require.Zero(t, storage.calls)
+
+			if !tt.stream {
+				require.Equal(t, statusClientClosedRequest, c.Writer.Status())
+				require.False(t, c.Writer.Written())
+				require.Empty(t, rec.Body.String())
+				return
+			}
+			frames := testChatImageSSEFrames(t, rec)
+			require.Len(t, frames, 1, "only the initial role chunk was written: %s", rec.Body.String())
+			require.True(t, strings.HasPrefix(frames[0], "data: "), frames[0])
+			var first apicompat.ChatCompletionsChunk
+			require.NoError(t, json.Unmarshal([]byte(strings.TrimPrefix(frames[0], "data: ")), &first))
+			require.Equal(t, "chat.completion.chunk", first.Object)
+			require.Equal(t, []apicompat.ChatChunkChoice{{Delta: apicompat.ChatDelta{Role: "assistant"}}}, first.Choices)
+		})
 	}
 }
 

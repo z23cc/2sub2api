@@ -137,6 +137,16 @@ func TestImagesResultToChatContent(t *testing.T) {
 			usage:     &ChatUsage{PromptTokens: 5, CompletionTokens: 10, TotalTokens: 15},
 		},
 		{
+			name:    "corrupt base64 falls back to URL",
+			result:  `{"data":[{"b64_json":"bad!","url":"https://example.com/cat.png"}]}`,
+			content: "![image](https://example.com/cat.png)",
+		},
+		{
+			name:    "corrupt base64 is retained when no URL is available",
+			result:  `{"data":[{"b64_json":"bad!"}]}`,
+			content: "![image](data:image/png;base64,bad!)",
+		},
+		{
 			name:    "default PNG and absent usage",
 			result:  `{"data":[{"b64_json":"aGk="}]}`,
 			content: "![image](data:image/png;base64,aGk=)",

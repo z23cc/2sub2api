@@ -83,7 +83,7 @@ func newChatImageHandler(t *testing.T, cfg *config.Config, upstream service.HTTP
 	return newChatImageHandlerWithGatewaySettings(t, cfg, upstream, cache, logs, billing, nil, nil)
 }
 
-func newChatImageHandlerWithGatewaySettings(t *testing.T, cfg *config.Config, upstream service.HTTPUpstream, cache service.BillingCache, logs service.UsageLogRepository, billing service.UsageBillingRepository, gatewayCache service.GatewayCache, settings *service.SettingService) (*OpenAIGatewayHandler, *service.APIKey) {
+func newChatImageHandlerWithGatewaySettings(t *testing.T, cfg *config.Config, upstream service.HTTPUpstream, cache service.BillingCache, logs service.UsageLogRepository, billing service.UsageBillingRepository, gatewayCache service.GatewayCache, settings *service.SettingService, customErrorCodes ...any) (*OpenAIGatewayHandler, *service.APIKey) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	group := &service.Group{
@@ -95,6 +95,10 @@ func newChatImageHandlerWithGatewaySettings(t *testing.T, cfg *config.Config, up
 		Status: service.StatusActive, Schedulable: true, GroupIDs: []int64{group.ID},
 		Credentials: map[string]any{"api_key": "test-key", "base_url": "https://images.example.com"},
 	}}}
+	if len(customErrorCodes) > 0 {
+		repo.accounts[0].Credentials["custom_error_codes_enabled"] = true
+		repo.accounts[0].Credentials["custom_error_codes"] = customErrorCodes
+	}
 	billingCache := service.NewBillingCacheService(cache, nil, nil, nil, nil, nil, cfg, nil)
 	t.Cleanup(billingCache.Stop)
 	gateway := service.NewOpenAIGatewayService(
@@ -311,7 +315,7 @@ func TestOpenAIChatImages_Errors(t *testing.T) {
 			name:     "upstream bad request after streaming starts",
 			request:  `{"model":"gpt-image-1","stream":true,` + chatImageMessage + `}`,
 			platform: service.PlatformOpenAI, allowImages: true, stream: true, wantStatus: http.StatusOK, wantCalls: 1,
-			wantError: `{"error":{"type":"invalid_request_error","code":"invalid_value","message":"Invalid image size"}}`,
+			wantError: chatImageError,
 		},
 		{
 			name: "image generation is disabled", request: chatImageRequest,
@@ -356,7 +360,7 @@ func TestOpenAIChatImages_Errors(t *testing.T) {
 				var first apicompat.ChatCompletionsChunk
 				require.NoError(t, json.Unmarshal([]byte(strings.TrimPrefix(frames[0], "data: ")), &first))
 				require.Equal(t, []apicompat.ChatChunkChoice{{Delta: apicompat.ChatDelta{Role: "assistant"}}}, first.Choices)
-				const errorPrefix = "event: error\ndata: "
+				const errorPrefix = "data: "
 				require.True(t, strings.HasPrefix(frames[1], errorPrefix), frames[1])
 				require.JSONEq(t, tt.wantError, strings.TrimPrefix(frames[1], errorPrefix))
 				require.Equal(t, "data: [DONE]", frames[2])
@@ -464,6 +468,62 @@ func TestOpenAIChatImages_LateNonStreamingErrorCountsTowardsSLA(t *testing.T) {
 	require.Equal(t, "Invalid image size", entry.ErrorMessage)
 }
 
+func TestOpenAIChatImages_LateStreamingErrorRecordsImagesStatus(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		accountCodes  []any
+		imagesStatus  int
+		wantErrorBody string
+	}{
+		{name: "400", imagesStatus: http.StatusBadRequest, wantErrorBody: chatImageError},
+		{
+			name: "500",
+			// Images maps an upstream status outside the account's configured list to 500.
+			accountCodes:  []any{float64(http.StatusTooManyRequests)},
+			imagesStatus:  http.StatusInternalServerError,
+			wantErrorBody: `{"error":{"type":"upstream_error","message":"Upstream gateway error"}}`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			setupOpsErrorLogTestQueue(t, 4)
+			upstream := &chatImageUpstream{status: http.StatusBadRequest, body: chatImageError}
+			h, apiKey := newChatImageHandlerWithGatewaySettings(t, &config.Config{RunMode: config.RunModeSimple},
+				upstream, nil, nil, nil, nil, nil, tt.accountCodes...)
+			repo := &ingressRejectOpsRepo{}
+			ops := service.NewOpsService(repo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+			router := gin.New()
+			router.Use(OpsErrorLoggerMiddleware(ops))
+			var marks []service.OpsStreamError
+			router.POST("/v1/chat/completions", func(c *gin.Context) {
+				setChatImageAuth(c, apiKey)
+				h.ChatCompletions(c)
+				marks = service.GetOpsStreamErrors(c)
+			})
+			body := `{"model":"gpt-image-1","stream":true,` + chatImageMessage + `}`
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			require.Len(t, upstream.calls, 1)
+			frames := testChatImageSSEFrames(t, rec)
+			require.Len(t, frames, 3, rec.Body.String())
+			require.True(t, strings.HasPrefix(frames[1], "data: "), frames[1])
+			require.JSONEq(t, tt.wantErrorBody, strings.TrimPrefix(frames[1], "data: "))
+			require.Equal(t, "data: [DONE]", frames[2])
+			require.Len(t, marks, 1)
+			require.True(t, marks[0].CountTowardsSLA)
+			require.False(t, marks[0].NonStream)
+			require.Equal(t, tt.imagesStatus, marks[0].IntendedStatus)
+			require.Equal(t, int64(1), OpsErrorLogQueueLength())
+			flushOpsErrorLogBatch([]opsErrorLogJob{<-opsErrorLogQueue})
+			require.Len(t, repo.entries, 1)
+			require.Equal(t, tt.imagesStatus, repo.entries[0].StatusCode)
+			require.True(t, repo.entries[0].Stream)
+		})
+	}
+}
+
 func TestOpenAIChatImages_PublicModel(t *testing.T) {
 	const publicModel = "public-image"
 	for _, tt := range []struct {
@@ -509,11 +569,15 @@ type chatImageStorage struct {
 	err         error
 	entered     chan struct{}
 	release     <-chan struct{}
+	onSave      func()
 }
 
 func (s *chatImageStorage) Save(ctx context.Context, key, contentType string, data []byte) (string, error) {
 	s.key, s.contentType, s.data = key, contentType, data
 	s.calls++
+	if s.onSave != nil {
+		s.onSave()
+	}
 	if s.entered != nil {
 		close(s.entered)
 		select {
@@ -561,6 +625,17 @@ func TestOpenAIChatImages_ObjectStorage(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOpenAIChatImages_UsesURLWhenBase64IsCorrupt(t *testing.T) {
+	const result = `{"created":1,"data":[{"b64_json":"bad!","url":"https://upstream.example.com/cat.png"}],"usage":{"input_tokens":5,"output_tokens":10,"total_tokens":15}}`
+	upstream := &chatImageUpstream{status: http.StatusOK, body: result}
+	h, apiKey := newChatImageHandler(t, &config.Config{RunMode: config.RunModeSimple}, upstream, nil, nil, nil)
+	rec := httptest.NewRecorder()
+	h.ChatCompletions(newChatImageContext(rec, apiKey, "/v1/chat/completions", chatImageRequest))
+
+	require.Len(t, upstream.calls, 1)
+	testChatImageCompletion(t, rec, "![image](https://upstream.example.com/cat.png)")
 }
 
 func TestOpenAIChatImages_KeepaliveDuringObjectStorageUpload(t *testing.T) {
@@ -846,21 +921,71 @@ func TestOpenAIChatImages_ClientDisconnectStillBills(t *testing.T) {
 			require.Equal(t, billing.commands[0].BalanceCost, billing.commands[1].BalanceCost)
 			require.Zero(t, storage.calls)
 
-			if !tt.stream {
-				require.Equal(t, statusClientClosedRequest, c.Writer.Status())
-				require.False(t, c.Writer.Written())
-				require.Empty(t, rec.Body.String())
-				return
-			}
-			frames := testChatImageSSEFrames(t, rec)
-			require.Len(t, frames, 1, "only the initial role chunk was written: %s", rec.Body.String())
-			require.True(t, strings.HasPrefix(frames[0], "data: "), frames[0])
-			var first apicompat.ChatCompletionsChunk
-			require.NoError(t, json.Unmarshal([]byte(strings.TrimPrefix(frames[0], "data: ")), &first))
-			require.Equal(t, "chat.completion.chunk", first.Object)
-			require.Equal(t, []apicompat.ChatChunkChoice{{Delta: apicompat.ChatDelta{Role: "assistant"}}}, first.Choices)
+			testChatImageDisconnectedResponse(t, c, rec, tt.stream)
 		})
 	}
+}
+
+func TestOpenAIChatImages_ClientDisconnectDuringUpload(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		stream  bool
+		saveErr error
+	}{
+		{name: "non_streaming_upload_success"},
+		{name: "non_streaming_upload_failure", saveErr: errors.New("upload failed")},
+		{name: "streaming_upload_success", stream: true},
+		{name: "streaming_upload_failure", stream: true, saveErr: errors.New("upload failed")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			upstream := &chatImageUpstream{status: http.StatusOK, body: chatImageResult}
+			logs := &chatImageUsageLogs{}
+			billing := &compatStreamUsageBillingRepo{}
+			cfg := &config.Config{RunMode: config.RunModeStandard}
+			h, apiKey := newChatImageHandler(t, cfg, upstream, chatImageBillingCache{newHandlerInflightCache(100)}, logs, billing)
+			price := 0.125
+			apiKey.Group.ImageCountBilling = true
+			apiKey.Group.ImagePrice1K = &price
+			rec := httptest.NewRecorder()
+			body := fmt.Sprintf(`{"model":"gpt-image-1","size":"1024x1024","stream":%t,`+chatImageMessage+`}`, tt.stream)
+			c := newChatImageContext(rec, apiKey, "/v1/chat/completions", body)
+			clientCtx, cancel := context.WithCancel(c.Request.Context())
+			defer cancel()
+			c.Request = c.Request.WithContext(clientCtx)
+			storage := &chatImageStorage{onSave: cancel, err: tt.saveErr}
+			h.imageStorageResolver = func() (*service.ImageResultUploader, bool) {
+				return service.NewImageResultUploader(storage, "images/", 1024, nil), true
+			}
+
+			require.NotPanics(t, func() { h.ChatCompletions(c) })
+
+			require.ErrorIs(t, clientCtx.Err(), context.Canceled)
+			require.Equal(t, 1, storage.calls)
+			require.Len(t, upstream.calls, 1)
+			require.Len(t, logs.rows, 1)
+			require.Equal(t, price, logs.rows[0].ActualCost)
+			require.Len(t, billing.commands, 1)
+			require.Equal(t, price, billing.commands[0].BalanceCost)
+			testChatImageDisconnectedResponse(t, c, rec, tt.stream)
+		})
+	}
+}
+
+func testChatImageDisconnectedResponse(t *testing.T, c *gin.Context, rec *httptest.ResponseRecorder, stream bool) {
+	t.Helper()
+	if !stream {
+		require.Equal(t, statusClientClosedRequest, c.Writer.Status())
+		require.False(t, c.Writer.Written())
+		require.Empty(t, rec.Body.String())
+		return
+	}
+	frames := testChatImageSSEFrames(t, rec)
+	require.Len(t, frames, 1, "only the initial role chunk was written: %s", rec.Body.String())
+	require.True(t, strings.HasPrefix(frames[0], "data: "), frames[0])
+	var first apicompat.ChatCompletionsChunk
+	require.NoError(t, json.Unmarshal([]byte(strings.TrimPrefix(frames[0], "data: ")), &first))
+	require.Equal(t, "chat.completion.chunk", first.Object)
+	require.Equal(t, []apicompat.ChatChunkChoice{{Delta: apicompat.ChatDelta{Role: "assistant"}}}, first.Choices)
 }
 
 type chatImageBillingCache struct {

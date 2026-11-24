@@ -256,7 +256,9 @@ func (h *AsyncImageHandler) run(taskID, platform string, taskCtx *gin.Context, r
 // recorder, interpreted the same way for async tasks and Chat image replies.
 type internalImageOutcome struct {
 	// ContextDone reports that the execution context ended before anything
-	// was written. Async tasks treat it as a timeout; Chat as a client gone.
+	// was written. Async tasks treat it as a timeout. Chat checks the client
+	// context itself, because Images detaches the upstream call and may still
+	// record a billed result after the client has gone.
 	ContextDone bool
 	// StatusCode is the semantic status. It prefers the local-failure status
 	// over the recorder's, because JSON whitespace keepalives may commit 200
@@ -334,6 +336,8 @@ func newAsyncImageContext(c *gin.Context, body []byte, timeoutDuration time.Dura
 // newInternalImageContext copies c into a context that runs an Images handler
 // on body at path, under ctx, and records the response instead of writing it
 // to the client. The copy keeps c's keys, including the inbound endpoint.
+// Ending ctx stops the handler's own stages; Images detaches its upstream
+// call, which runs to completion and is billed regardless.
 func newInternalImageContext(c *gin.Context, ctx context.Context, path string, body []byte) (*gin.Context, *httptest.ResponseRecorder) {
 	request := c.Request.Clone(ctx)
 	request.Body = pkghttputil.NewPrereadBody(body)

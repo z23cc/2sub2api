@@ -78,7 +78,11 @@ func (h *OpenAIGatewayHandler) chatCompletionsImages(c *gin.Context, reqLog *zap
 
 	inboundEndpoint := GetInboundEndpoint(c)
 	imagesPath, upstreamEndpoint := chatImagesPath(c.Request.URL.Path, imagesReq.Edits)
-	// The client's own context: a disconnect cancels generation, as on /images.
+	// The client's own context, as on /images: a disconnect ends the stages
+	// before the upstream call (selection, audit, slots), but Images detaches
+	// the upstream call itself, so once it has started the image is generated
+	// and billed by the /images rules even if the client leaves. Chat then only
+	// stops writing to the gone client.
 	inner, recorder := newInternalImageContext(c, c.Request.Context(), imagesPath, imagesReq.Body)
 	inner.Request.Header.Set("Content-Type", "application/json")
 	inner.Request.Header.Set("Accept", "application/json")
@@ -117,10 +121,14 @@ func (h *OpenAIGatewayHandler) chatCompletionsImages(c *gin.Context, reqLog *zap
 	setOpsEndpointContext(c, "", int16(service.RequestTypeFromLegacy(reqStream, false)))
 
 	outcome := readInternalImageOutcome(inner, recorder)
+	// Billing already happened inside Images; with nobody to deliver to, skip
+	// the object storage upload and the reply.
+	clientGone := c.Request.Context().Err() != nil
 	var content string
 	var usage *apicompat.ChatUsage
 	emptyResult := false
 	switch {
+	case clientGone:
 	case outcome.Succeeded():
 		result := h.offloadChatImages(c, reqLog, outcome.Body)
 		var err error
@@ -155,8 +163,9 @@ func (h *OpenAIGatewayHandler) chatCompletionsImages(c *gin.Context, reqLog *zap
 		jsonCommitted = service.StopOpenAIImagesJSONKeepaliveCommitted(c)
 	}
 
-	if outcome.ContextDone {
-		reqLog.Info("openai_chat_completions.images_client_gone")
+	if clientGone {
+		reqLog.Info("openai_chat_completions.images_client_gone", zap.Bool("images_result_recorded", !outcome.ContextDone))
+		failoverClientGone(c)
 		return
 	}
 	if !outcome.Succeeded() && !emptyResult {

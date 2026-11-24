@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -371,28 +372,32 @@ func (u *ImageResultUploader) download(ctx context.Context, rawURL string) ([]by
 	return data, contentType, nil
 }
 
-// redactImageDownloadError strips the query, fragment and userinfo from the
-// URL a *url.Error carries: upstream image URLs are often signed, and these
-// errors end up in logs.
-func redactImageDownloadError(err error) error {
-	var urlErr *url.Error
-	if !errors.As(err, &urlErr) {
-		return err
-	}
-	return &url.Error{Op: urlErr.Op, URL: redactImageDownloadURL(urlErr.URL), Err: urlErr.Err}
+// redactedImageDownloadError hides signed URL parts from the error text, which
+// ends up in logs, while Unwrap still returns the original error.
+type redactedImageDownloadError struct {
+	message string
+	err     error
 }
 
-func redactImageDownloadURL(rawURL string) string {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return "[redacted url]"
+func (e *redactedImageDownloadError) Error() string { return e.message }
+func (e *redactedImageDownloadError) Unwrap() error { return e.err }
+
+var (
+	imageDownloadErrorUserinfo = regexp.MustCompile(`//[^/\s"'<>@]*@`)
+	imageDownloadErrorQuery    = regexp.MustCompile(`[?#][^\s"'<>]*`)
+)
+
+// redactImageDownloadError strips query strings, fragments and userinfo from
+// every URL in the error text: upstream image URLs are often signed, and the
+// standard library embeds them both in *url.Error and in nested messages
+// such as an unparsable redirect Location.
+func redactImageDownloadError(err error) error {
+	if err == nil {
+		return nil
 	}
-	parsed.User = nil
-	parsed.RawQuery = ""
-	parsed.ForceQuery = false
-	parsed.Fragment = ""
-	parsed.RawFragment = ""
-	return parsed.String()
+	message := imageDownloadErrorUserinfo.ReplaceAllString(err.Error(), "//")
+	message = imageDownloadErrorQuery.ReplaceAllString(message, "")
+	return &redactedImageDownloadError{message: message, err: err}
 }
 
 func (u *ImageResultUploader) buildKey(taskID string, index int, contentType string) string {

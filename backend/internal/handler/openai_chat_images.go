@@ -163,7 +163,8 @@ func (h *OpenAIGatewayHandler) chatCompletionsImages(c *gin.Context, reqLog *zap
 		jsonCommitted = service.StopOpenAIImagesJSONKeepaliveCommitted(c)
 	}
 
-	if clientGone {
+	// The client may also have left during the object storage upload.
+	if clientGone || c.Request.Context().Err() != nil {
 		reqLog.Info("openai_chat_completions.images_client_gone", zap.Bool("images_result_recorded", !outcome.ContextDone))
 		failoverClientGone(c)
 		return
@@ -286,7 +287,18 @@ func (h *OpenAIGatewayHandler) writeChatImagesError(c *gin.Context, sse *chatIma
 	}
 
 	if sse != nil {
-		h.handleStreamingAwareErrorWithCode(c, outcome.StatusCode, errType, code, detail.Message, true, true)
+		// The data-only frame keeps the whole recorded error object (param
+		// included). Ops records it through the SLA marker at the Images
+		// status; an "event: error" frame would make ops infer the status from
+		// the event instead.
+		service.MarkOpsStreamErrorValue(c, service.OpsStreamError{
+			ErrType:         errType,
+			Code:            code,
+			Message:         detail.Message,
+			IntendedStatus:  outcome.StatusCode,
+			CountTowardsSLA: true,
+		})
+		sse.writeData(payload)
 		sse.writeDone()
 		return
 	}

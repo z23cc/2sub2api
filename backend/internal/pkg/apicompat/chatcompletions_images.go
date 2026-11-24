@@ -1,6 +1,7 @@
 package apicompat
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -155,8 +156,9 @@ var ErrChatImagesNoImages = errors.New("image response contains no images")
 // ImagesResultToChatContent renders an Images API response as markdown image
 // content and maps its usage. b64_json items become data URLs typed by the
 // response's output_format, then defaultOutputFormat, then png; items without
-// b64_json use their url. b64 wins because an upstream url may expire or be
-// unreachable for the client, while object storage offload removes b64_json.
+// b64_json use their url. A b64_json that decodes wins over a url, because an
+// upstream url may expire or be unreachable for the client, while object
+// storage offload removes b64_json; a corrupt one yields to the url.
 // Several images are separated by a blank line. A response without images
 // returns ErrChatImagesNoImages together with its usage.
 func ImagesResultToChatContent(result []byte, defaultOutputFormat string) (string, *ChatUsage, error) {
@@ -171,11 +173,18 @@ func ImagesResultToChatContent(result []byte, defaultOutputFormat string) (strin
 
 	var images []string
 	for _, item := range gjson.GetBytes(result, "data").Array() {
-		if b64 := strings.TrimSpace(item.Get("b64_json").String()); b64 != "" {
-			images = append(images, fmt.Sprintf("![image](data:%s;base64,%s)", mimeType, b64))
-			continue
+		b64 := strings.TrimSpace(item.Get("b64_json").String())
+		imageURL := strings.TrimSpace(item.Get("url").String())
+		if b64 != "" && imageURL != "" {
+			// A corrupt b64_json must not hide a usable url.
+			if _, err := base64.StdEncoding.DecodeString(b64); err != nil {
+				b64 = ""
+			}
 		}
-		if imageURL := strings.TrimSpace(item.Get("url").String()); imageURL != "" {
+		switch {
+		case b64 != "":
+			images = append(images, fmt.Sprintf("![image](data:%s;base64,%s)", mimeType, b64))
+		case imageURL != "":
 			images = append(images, "![image]("+imageURL+")")
 		}
 	}

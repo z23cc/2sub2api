@@ -66,7 +66,10 @@ func ChatCompletionsToImagesRequest(body []byte) (*ChatImagesRequest, error) {
 			}
 		}
 	}
-	prompt, imageURLs := chatImagesUserInput(lastUser.Get("content"))
+	prompt, imageURLs, err := chatImagesUserInput(lastUser.Get("content"))
+	if err != nil {
+		return nil, err
+	}
 	if prompt == "" {
 		return nil, &ChatImagesRequestError{Message: "the last user message must contain a text prompt"}
 	}
@@ -112,12 +115,12 @@ func ChatCompletionsToImagesRequest(body []byte) (*ChatImagesRequest, error) {
 	}, nil
 }
 
-func chatImagesUserInput(content gjson.Result) (string, []string) {
+func chatImagesUserInput(content gjson.Result) (string, []string, error) {
 	if content.Type == gjson.String {
-		return strings.TrimSpace(content.String()), nil
+		return strings.TrimSpace(content.String()), nil, nil
 	}
 	if !content.IsArray() {
-		return "", nil
+		return "", nil, nil
 	}
 	var texts, imageURLs []string
 	for _, part := range content.Array() {
@@ -131,18 +134,31 @@ func chatImagesUserInput(content gjson.Result) (string, []string) {
 			if imageURL.IsObject() {
 				imageURL = imageURL.Get("url")
 			}
-			if value := strings.TrimSpace(imageURL.String()); value != "" {
-				imageURLs = append(imageURLs, value)
+			value := ""
+			if imageURL.Type == gjson.String {
+				value = strings.TrimSpace(imageURL.String())
 			}
+			// Dropping it would silently turn an edit into a billed generation,
+			// or edit with only some of the input images.
+			if value == "" {
+				return "", nil, &ChatImagesRequestError{Message: "image_url content parts must include a non-empty url"}
+			}
+			imageURLs = append(imageURLs, value)
 		}
 	}
-	return strings.TrimSpace(strings.Join(texts, "\n")), imageURLs
+	return strings.TrimSpace(strings.Join(texts, "\n")), imageURLs, nil
 }
 
+// ErrChatImagesNoImages reports a valid Images response without any image.
+var ErrChatImagesNoImages = errors.New("image response contains no images")
+
 // ImagesResultToChatContent renders an Images API response as markdown image
-// content and maps its usage. Items with a url use it directly; b64_json items
-// become data URLs typed by the response's output_format, then
-// defaultOutputFormat, then png. Several images are separated by a blank line.
+// content and maps its usage. b64_json items become data URLs typed by the
+// response's output_format, then defaultOutputFormat, then png; items without
+// b64_json use their url. b64 wins because an upstream url may expire or be
+// unreachable for the client, while object storage offload removes b64_json.
+// Several images are separated by a blank line. A response without images
+// returns ErrChatImagesNoImages together with its usage.
 func ImagesResultToChatContent(result []byte, defaultOutputFormat string) (string, *ChatUsage, error) {
 	if !gjson.ValidBytes(result) {
 		return "", nil, errors.New("image response is not valid JSON")
@@ -155,18 +171,19 @@ func ImagesResultToChatContent(result []byte, defaultOutputFormat string) (strin
 
 	var images []string
 	for _, item := range gjson.GetBytes(result, "data").Array() {
-		if imageURL := strings.TrimSpace(item.Get("url").String()); imageURL != "" {
-			images = append(images, "![image]("+imageURL+")")
-			continue
-		}
 		if b64 := strings.TrimSpace(item.Get("b64_json").String()); b64 != "" {
 			images = append(images, fmt.Sprintf("![image](data:%s;base64,%s)", mimeType, b64))
+			continue
+		}
+		if imageURL := strings.TrimSpace(item.Get("url").String()); imageURL != "" {
+			images = append(images, "![image]("+imageURL+")")
 		}
 	}
+	usage := chatImagesUsage(gjson.GetBytes(result, "usage"))
 	if len(images) == 0 {
-		return "", nil, errors.New("image response contains no images")
+		return "", usage, ErrChatImagesNoImages
 	}
-	return strings.Join(images, "\n\n"), chatImagesUsage(gjson.GetBytes(result, "usage")), nil
+	return strings.Join(images, "\n\n"), usage, nil
 }
 
 func chatImagesMIMEType(outputFormat string) string {

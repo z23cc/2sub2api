@@ -336,11 +336,11 @@ func (u *ImageResultUploader) decodeImageDataURL(rawURL string) ([]byte, string,
 func (u *ImageResultUploader) download(ctx context.Context, rawURL string) ([]byte, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, "", fmt.Errorf("build download request: %w", err)
+		return nil, "", fmt.Errorf("build download request: %w", redactImageDownloadError(err))
 	}
 	resp, err := u.httpClient.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("download image: %w", err)
+		return nil, "", fmt.Errorf("download image: %w", redactImageDownloadError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
@@ -369,6 +369,30 @@ func (u *ImageResultUploader) download(ctx context.Context, rawURL string) ([]by
 		return nil, "", errors.New("download image: content is not an image")
 	}
 	return data, contentType, nil
+}
+
+// redactImageDownloadError strips the query, fragment and userinfo from the
+// URL a *url.Error carries: upstream image URLs are often signed, and these
+// errors end up in logs.
+func redactImageDownloadError(err error) error {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return err
+	}
+	return &url.Error{Op: urlErr.Op, URL: redactImageDownloadURL(urlErr.URL), Err: urlErr.Err}
+}
+
+func redactImageDownloadURL(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "[redacted url]"
+	}
+	parsed.User = nil
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	parsed.Fragment = ""
+	parsed.RawFragment = ""
+	return parsed.String()
 }
 
 func (u *ImageResultUploader) buildKey(taskID string, index int, contentType string) string {

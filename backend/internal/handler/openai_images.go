@@ -478,6 +478,9 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 			upstreamModel = result.UpstreamModel
 		}
 		sessionID := service.ExtractClientSessionID(c)
+		if result != nil && c.GetBool(chatImagesClientStreamKey) {
+			result.Stream = true
+		}
 		usageInput := &service.OpenAIRecordUsageInput{
 			Result:             result,
 			APIKey:             apiKey,

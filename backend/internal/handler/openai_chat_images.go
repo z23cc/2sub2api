@@ -1,15 +1,18 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -21,6 +24,16 @@ import (
 // has no client to keep alive, and a committed 200 there would hide the
 // upstream status from the Chat reply.
 const chatImagesInternalRequestKey = "chat_images_internal_request"
+
+// chatImagesClientStreamKey carries whether the Chat client streams. Images
+// itself always runs non-streaming, but its usage row records the client's
+// mode; the stream flag does not change the charged amount.
+const chatImagesClientStreamKey = "chat_images_client_stream"
+
+const (
+	chatImagesEmptyResultCode    = "image_generation_empty"
+	chatImagesEmptyResultMessage = "The image service did not return an image. Please try a different prompt."
+)
 
 // chatImagesPlatformSupported reports whether the key's group serves
 // gpt-image-* through the OpenAI Images pipeline, the same platform choice the
@@ -56,8 +69,11 @@ func (h *OpenAIGatewayHandler) chatCompletionsImages(c *gin.Context, reqLog *zap
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", reqErr.Message)
 		return
 	}
-	reqLog = reqLog.With(zap.String("model", reqModel), zap.Bool("stream", reqStream), zap.Bool("chat_images_edits", imagesReq.Edits))
-	setOpsRequestContext(c, reqModel, reqStream)
+	// Composite routing rewrites the body to the internal model; replies and the
+	// outer ops record use the name the client wrote.
+	publicModel := clientRequestedModel(c, reqModel)
+	reqLog = reqLog.With(zap.String("model", publicModel), zap.Bool("stream", reqStream), zap.Bool("chat_images_edits", imagesReq.Edits))
+	setOpsRequestContext(c, publicModel, reqStream)
 	setOpsEndpointContext(c, "", int16(service.RequestTypeFromLegacy(reqStream, false)))
 
 	inboundEndpoint := GetInboundEndpoint(c)
@@ -69,6 +85,7 @@ func (h *OpenAIGatewayHandler) chatCompletionsImages(c *gin.Context, reqLog *zap
 	inner.Request.Header.Del("Content-Encoding")
 	inner.Request.Header.Del("Content-Length")
 	inner.Set(chatImagesInternalRequestKey, true)
+	inner.Set(chatImagesClientStreamKey, reqStream)
 	// Usage and ops keep the Chat entry point, while the upstream endpoint
 	// matches a direct Images request.
 	inner.Set(ctxKeyInboundEndpoint, inboundEndpoint)
@@ -81,7 +98,7 @@ func (h *OpenAIGatewayHandler) chatCompletionsImages(c *gin.Context, reqLog *zap
 	// They start after the copy above so the inner context cannot see them.
 	var sse *chatImagesSSE
 	if reqStream {
-		sse = startChatImagesSSE(c, apicompat.ChatImageRoleChunk(id, reqModel, created), h.chatImagesStreamKeepaliveInterval())
+		sse = startChatImagesSSE(c, apicompat.ChatImageRoleChunk(id, publicModel, created), h.chatImagesStreamKeepaliveInterval())
 		*streamStarted = true
 		defer sse.stop()
 	} else {
@@ -95,21 +112,40 @@ func (h *OpenAIGatewayHandler) chatCompletionsImages(c *gin.Context, reqLog *zap
 	// The keepalive keeps running through the object storage upload below,
 	// which reads only the recorded result and never writes the client.
 	mergeChatImagesKeys(c, inner)
-	setOpsRequestContext(c, reqModel, reqStream)
+	syncChatImagesRequestContext(c, inner)
+	setOpsRequestContext(c, publicModel, reqStream)
 	setOpsEndpointContext(c, "", int16(service.RequestTypeFromLegacy(reqStream, false)))
 
 	outcome := readInternalImageOutcome(inner, recorder)
 	var content string
 	var usage *apicompat.ChatUsage
-	if outcome.Succeeded() {
+	emptyResult := false
+	switch {
+	case outcome.Succeeded():
 		result := h.offloadChatImages(c, reqLog, outcome.Body)
 		var err error
 		content, usage, err = apicompat.ImagesResultToChatContent(result, imagesReq.OutputFormat)
 		if err != nil {
-			// Images bills only images it counted, so an empty result was not charged.
 			reqLog.Warn("openai_chat_completions.images_result_unrenderable", zap.Error(err))
-			outcome = internalImageOutcome{StatusCode: http.StatusBadGateway, InvalidSuccess: true}
+			emptyResult = true
 		}
+	case outcome.InvalidSuccess:
+		reqLog.Warn("openai_chat_completions.images_result_invalid", zap.Int("body_bytes", len(outcome.Body)))
+		emptyResult = true
+	}
+	if emptyResult {
+		// A 2xx without images may still be billed (image_count_billing charges
+		// at least one image), so it answers 200 like /images: a 5xx would make
+		// SDKs retry and charge again. Ops still records the request as failed.
+		content = chatImagesEmptyResultMessage
+		service.MarkOpsStreamErrorValue(c, service.OpsStreamError{
+			ErrType:         "upstream_error",
+			Code:            chatImagesEmptyResultCode,
+			Message:         "upstream returned no image",
+			IntendedStatus:  http.StatusBadGateway,
+			CountTowardsSLA: true,
+			NonStream:       !reqStream,
+		})
 	}
 
 	jsonCommitted := false
@@ -123,21 +159,52 @@ func (h *OpenAIGatewayHandler) chatCompletionsImages(c *gin.Context, reqLog *zap
 		reqLog.Info("openai_chat_completions.images_client_gone")
 		return
 	}
-	if !outcome.Succeeded() {
+	if !outcome.Succeeded() && !emptyResult {
 		h.writeChatImagesError(c, sse, recorder, outcome, jsonCommitted)
 		return
 	}
 
 	if sse == nil {
-		c.JSON(http.StatusOK, apicompat.NewChatImageCompletion(id, reqModel, created, content, usage))
+		c.JSON(http.StatusOK, apicompat.NewChatImageCompletion(id, publicModel, created, content, usage))
 		return
 	}
-	sse.writeChunk(apicompat.ChatImageContentChunk(id, reqModel, created, content))
-	sse.writeChunk(apicompat.ChatImageFinishChunk(id, reqModel, created))
+	sse.writeChunk(apicompat.ChatImageContentChunk(id, publicModel, created, content))
+	sse.writeChunk(apicompat.ChatImageFinishChunk(id, publicModel, created))
 	if imagesReq.IncludeUsage {
-		sse.writeChunk(apicompat.ChatImageUsageChunk(id, reqModel, created, usage))
+		sse.writeChunk(apicompat.ChatImageUsageChunk(id, publicModel, created, usage))
 	}
 	sse.writeDone()
+}
+
+// syncChatImagesRequestContext copies the selected account and platform that
+// Images stored on its request context, so request logs and connection
+// traces of the outer request carry them.
+func syncChatImagesRequestContext(c, inner *gin.Context) {
+	innerCtx := inner.Request.Context()
+	ctx := c.Request.Context()
+	changed := false
+	if accountID, ok := innerCtx.Value(ctxkey.AccountID).(int64); ok && accountID > 0 {
+		ctx = context.WithValue(ctx, ctxkey.AccountID, accountID)
+		changed = true
+	}
+	if platform, ok := innerCtx.Value(ctxkey.Platform).(string); ok && platform != "" {
+		ctx = context.WithValue(ctx, ctxkey.Platform, platform)
+		changed = true
+	}
+	if changed {
+		c.Request = c.Request.WithContext(ctx)
+	}
+}
+
+// chatImagesRegionalFundsEnabled reports coordinated regional funds. Images
+// forwarding has no regional meter, so the gateway rejects /images in this
+// mode; Chat image requests must be rejected the same way or they would be
+// generated but never billed.
+func (h *OpenAIGatewayHandler) chatImagesRegionalFundsEnabled() bool {
+	if h.gatewayService.RegionalFundsReadiness() != nil {
+		return true
+	}
+	return h.cfg != nil && h.cfg.Runtime.RegionalFundsFile != ""
 }
 
 // chatImagesPath maps the Chat path onto the Images path with the same prefix
@@ -180,9 +247,11 @@ func (h *OpenAIGatewayHandler) offloadChatImages(c *gin.Context, reqLog *zap.Log
 	return rewritten
 }
 
-// writeChatImagesError reports a failed image attempt. Before the stream
-// starts it repeats the Images status and OpenAI error body; once it has
-// started, it sends an in-band error followed by [DONE].
+// writeChatImagesError reports a failed image attempt. Before anything is
+// committed it repeats the Images status and OpenAI error body. Once the
+// stream or a JSON keepalive has committed 200, the error is marked as a
+// request failure that counts towards the SLA: streams send it as an
+// "event: error" frame followed by [DONE], JSON as the error body.
 func (h *OpenAIGatewayHandler) writeChatImagesError(c *gin.Context, sse *chatImagesSSE, recorder *httptest.ResponseRecorder, outcome internalImageOutcome, jsonCommitted bool) {
 	errorObject := outcome.ErrorObject()
 	payload, err := json.Marshal(map[string]json.RawMessage{"error": errorObject})
@@ -191,13 +260,24 @@ func (h *OpenAIGatewayHandler) writeChatImagesError(c *gin.Context, sse *chatIma
 	}
 	var detail struct {
 		Type    string `json:"type"`
+		Code    any    `json:"code"`
 		Message string `json:"message"`
 	}
 	_ = json.Unmarshal(errorObject, &detail)
+	errType := strings.TrimSpace(detail.Type)
+	if errType == "" {
+		errType = "api_error"
+	}
+	code := ""
+	switch value := detail.Code.(type) {
+	case string:
+		code = value
+	case float64:
+		code = strconv.Itoa(int(value))
+	}
 
 	if sse != nil {
-		service.MarkOpsStreamError(c, detail.Type, detail.Message, outcome.StatusCode)
-		sse.writeData(payload)
+		h.handleStreamingAwareErrorWithCode(c, outcome.StatusCode, errType, code, detail.Message, true, true)
 		sse.writeDone()
 		return
 	}
@@ -205,6 +285,14 @@ func (h *OpenAIGatewayHandler) writeChatImagesError(c *gin.Context, sse *chatIma
 	if jsonCommitted {
 		// A whitespace keepalive already committed 200, as on /images.
 		status = http.StatusOK
+		service.MarkOpsStreamErrorValue(c, service.OpsStreamError{
+			ErrType:         errType,
+			Code:            code,
+			Message:         detail.Message,
+			IntendedStatus:  outcome.StatusCode,
+			CountTowardsSLA: true,
+			NonStream:       true,
+		})
 	} else if retryAfter := recorder.Header().Get("Retry-After"); retryAfter != "" {
 		c.Header("Retry-After", retryAfter)
 	}

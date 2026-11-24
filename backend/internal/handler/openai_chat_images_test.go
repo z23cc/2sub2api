@@ -29,6 +29,7 @@ const (
 	chatImageResult  = `{"created":1,"data":[{"b64_json":"aGk="}],"usage":{"input_tokens":5,"output_tokens":10,"total_tokens":15}}`
 	chatImageContent = "![image](data:image/png;base64,aGk=)"
 	chatImageError   = `{"error":{"type":"invalid_request_error","code":"invalid_value","message":"Invalid image size","param":"size"}}`
+	chatImageOSSURL  = "https://storage.example.com/cat.png"
 )
 
 type chatImageUpstreamCall struct {
@@ -156,15 +157,27 @@ func TestOpenAIChatImages_NonStreaming(t *testing.T) {
 
 type chatImageKeepaliveRecorder struct {
 	*httptest.ResponseRecorder
-	seen chan struct{}
+	frame  string
+	after  <-chan struct{}
+	seen   chan struct{}
+	status int
 }
 
 func (r *chatImageKeepaliveRecorder) Write(p []byte) (int, error) {
+	observe := string(p) == r.frame
+	if observe && r.after != nil {
+		select {
+		case <-r.after:
+		default:
+			observe = false
+		}
+	}
 	n, err := r.ResponseRecorder.Write(p)
-	if err == nil && string(p) == ": keepalive\n\n" {
+	if err == nil && observe {
 		select {
 		case <-r.seen:
 		default:
+			r.status = r.Code
 			close(r.seen)
 		}
 	}
@@ -189,7 +202,7 @@ func TestOpenAIChatImages_Streaming(t *testing.T) {
 				cfg.Gateway.ImageStreamKeepaliveInterval = 1
 				cfg.Gateway.ImageNonstreamKeepaliveInterval = 1
 				seen := make(chan struct{})
-				writer = &chatImageKeepaliveRecorder{ResponseRecorder: rec, seen: seen}
+				writer = &chatImageKeepaliveRecorder{ResponseRecorder: rec, frame: ": keepalive\n\n", seen: seen}
 				upstream.wait = seen
 			}
 			h, apiKey := newChatImageHandler(t, cfg, upstream, nil, nil, nil)
@@ -328,12 +341,22 @@ type chatImageStorage struct {
 	data        []byte
 	calls       int
 	err         error
+	entered     chan struct{}
+	release     <-chan struct{}
 }
 
-func (s *chatImageStorage) Save(_ context.Context, key, contentType string, data []byte) (string, error) {
+func (s *chatImageStorage) Save(ctx context.Context, key, contentType string, data []byte) (string, error) {
 	s.key, s.contentType, s.data = key, contentType, data
 	s.calls++
-	return "https://storage.example.com/cat.png", s.err
+	if s.entered != nil {
+		close(s.entered)
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	return chatImageOSSURL, s.err
 }
 
 func TestOpenAIChatImages_ObjectStorage(t *testing.T) {
@@ -343,7 +366,7 @@ func TestOpenAIChatImages_ObjectStorage(t *testing.T) {
 		saveErr error
 		content string
 	}{
-		{name: "uploaded", enabled: true, content: "![image](https://storage.example.com/cat.png)"},
+		{name: "uploaded", enabled: true, content: "![image](" + chatImageOSSURL + ")"},
 		{name: "disabled", content: chatImageContent},
 		{name: "failed upload", enabled: true, saveErr: errors.New("test storage error"), content: chatImageContent},
 	} {
@@ -368,6 +391,93 @@ func TestOpenAIChatImages_ObjectStorage(t *testing.T) {
 				require.Equal(t, []byte("hi"), storage.data)
 			} else {
 				require.Zero(t, storage.calls)
+			}
+		})
+	}
+}
+
+func TestOpenAIChatImages_KeepaliveDuringObjectStorageUpload(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		stream bool
+		frame  string
+	}{
+		{name: "streaming", stream: true, frame: ": keepalive\n\n"},
+		{name: "non-streaming", frame: " \n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{RunMode: config.RunModeSimple}
+			cfg.Gateway.ImageStreamKeepaliveInterval = 1
+			cfg.Gateway.ImageNonstreamKeepaliveInterval = 1
+			upstream := &chatImageUpstream{status: http.StatusOK, body: chatImageResult}
+			h, apiKey := newChatImageHandler(t, cfg, upstream, nil, nil, nil)
+			release := make(chan struct{})
+			storage := &chatImageStorage{entered: make(chan struct{}), release: release}
+			h.imageStorageResolver = func() (*service.ImageResultUploader, bool) {
+				return service.NewImageResultUploader(storage, "images/", 1024, nil), true
+			}
+
+			rec := httptest.NewRecorder()
+			writer := &chatImageKeepaliveRecorder{
+				ResponseRecorder: rec, frame: tt.frame, after: storage.entered, seen: make(chan struct{}),
+			}
+			body := fmt.Sprintf(`{"model":"gpt-image-1","stream":%t,`+chatImageMessage+`}`, tt.stream)
+			c := newChatImageContext(writer, apiKey, "/v1/chat/completions", body)
+			ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+			c.Request = c.Request.WithContext(ctx)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				h.ChatCompletions(c)
+			}()
+			defer func() {
+				cancel()
+				<-done
+			}()
+
+			select {
+			case <-storage.entered:
+			case <-done:
+				t.Fatal("handler returned before calling storage Save")
+			case <-ctx.Done():
+				t.Fatal("timed out waiting for storage Save")
+			}
+			select {
+			case <-writer.seen:
+				require.Equal(t, http.StatusOK, writer.status)
+			case <-ctx.Done():
+				t.Fatal("no keepalive was written after storage Save began")
+			}
+			close(release)
+			<-done
+
+			require.Equal(t, 1, storage.calls)
+			content := "![image](" + chatImageOSSURL + ")"
+			if !tt.stream {
+				require.True(t, strings.HasPrefix(rec.Body.String(), tt.frame))
+				require.True(t, rec.Flushed)
+				testChatImageCompletion(t, rec, content)
+				return
+			}
+
+			frames := testChatImageSSEFrames(t, rec)
+			require.GreaterOrEqual(t, len(frames), 5, rec.Body.String())
+			require.Equal(t, "data: [DONE]", frames[len(frames)-1])
+			for _, frame := range frames[1 : len(frames)-3] {
+				require.Equal(t, ": keepalive", frame)
+			}
+			stop := "stop"
+			chunkFrames := []string{frames[0], frames[len(frames)-3], frames[len(frames)-2]}
+			for i, want := range []apicompat.ChatChunkChoice{
+				{Delta: apicompat.ChatDelta{Role: "assistant"}},
+				{Delta: apicompat.ChatDelta{Content: &content}},
+				{FinishReason: &stop},
+			} {
+				require.True(t, strings.HasPrefix(chunkFrames[i], "data: "), chunkFrames[i])
+				var chunk apicompat.ChatCompletionsChunk
+				require.NoError(t, json.Unmarshal([]byte(strings.TrimPrefix(chunkFrames[i], "data: ")), &chunk))
+				require.Equal(t, "chat.completion.chunk", chunk.Object)
+				require.Equal(t, []apicompat.ChatChunkChoice{want}, chunk.Choices)
 			}
 		})
 	}

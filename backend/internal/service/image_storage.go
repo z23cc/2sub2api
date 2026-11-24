@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -133,7 +132,7 @@ func (t *imageDownloadTransport) route(req *http.Request) (http.RoundTripper, er
 	}
 	host := req.URL.Hostname()
 	if isBlockedImageDownloadHost(host) {
-		return nil, fmt.Errorf("image url host is not allowed: %s", host)
+		return nil, &imageDownloadHostNotAllowedError{host: host}
 	}
 	var proxyURL *url.URL
 	if t.proxy != nil {
@@ -153,9 +152,19 @@ func (t *imageDownloadTransport) route(req *http.Request) (http.RoundTripper, er
 		return nil, fmt.Errorf("resolve image url host: %w", err)
 	}
 	if blocked {
-		return nil, fmt.Errorf("image url host is not allowed: %s", host)
+		return nil, &imageDownloadHostNotAllowedError{host: host}
 	}
 	return t.proxied, nil
+}
+
+// imageDownloadHostNotAllowedError names a blocked download host. A host
+// carries no signature, so its text is safe to log.
+type imageDownloadHostNotAllowedError struct {
+	host string
+}
+
+func (e *imageDownloadHostNotAllowedError) Error() string {
+	return "image url host is not allowed: " + e.host
 }
 
 // Proxy transports cannot inspect the proxy's remote resolution; fail closed
@@ -337,11 +346,11 @@ func (u *ImageResultUploader) decodeImageDataURL(rawURL string) ([]byte, string,
 func (u *ImageResultUploader) download(ctx context.Context, rawURL string) ([]byte, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, "", fmt.Errorf("build download request: %w", redactImageDownloadError(err))
+		return nil, "", fmt.Errorf("build download request: %w", redactImageDownloadError(rawURL, err))
 	}
 	resp, err := u.httpClient.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("download image: %w", redactImageDownloadError(err))
+		return nil, "", fmt.Errorf("download image: %w", redactImageDownloadError(rawURL, err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
@@ -372,32 +381,60 @@ func (u *ImageResultUploader) download(ctx context.Context, rawURL string) ([]by
 	return data, contentType, nil
 }
 
-// redactedImageDownloadError hides signed URL parts from the error text, which
-// ends up in logs, while Unwrap still returns the original error.
+// redactedImageDownloadError replaces the text of a download error, which ends
+// up in logs, with a fixed message naming only the target's scheme and host
+// and a coarse reason. Upstream image URLs are often signed, and the standard
+// library embeds them in its error text (also nested, e.g. an unparsable
+// redirect Location). Unwrap still returns the original error. The type must
+// not implement fmt.Formatter: zap would print the original chain through it.
 type redactedImageDownloadError struct {
-	message string
-	err     error
+	target string
+	reason string
+	err    error
 }
 
-func (e *redactedImageDownloadError) Error() string { return e.message }
+func (e *redactedImageDownloadError) Error() string {
+	return "request to " + e.target + " failed (" + e.reason + ")"
+}
+
 func (e *redactedImageDownloadError) Unwrap() error { return e.err }
 
-var (
-	imageDownloadErrorUserinfo = regexp.MustCompile(`//[^/\s"'<>@]*@`)
-	imageDownloadErrorQuery    = regexp.MustCompile(`[?#][^\s"'<>]*`)
-)
-
-// redactImageDownloadError strips query strings, fragments and userinfo from
-// every URL in the error text: upstream image URLs are often signed, and the
-// standard library embeds them both in *url.Error and in nested messages
-// such as an unparsable redirect Location.
-func redactImageDownloadError(err error) error {
+// redactImageDownloadError wraps err from requesting rawURL. The target comes
+// from rawURL itself, never from the error text.
+func redactImageDownloadError(rawURL string, err error) error {
 	if err == nil {
 		return nil
 	}
-	message := imageDownloadErrorUserinfo.ReplaceAllString(err.Error(), "//")
-	message = imageDownloadErrorQuery.ReplaceAllString(message, "")
-	return &redactedImageDownloadError{message: message, err: err}
+	target := "unknown host"
+	if parsed, parseErr := url.Parse(rawURL); parseErr == nil && parsed.Host != "" {
+		target = parsed.Scheme + "://" + parsed.Host
+	}
+	return &redactedImageDownloadError{target: target, reason: imageDownloadErrorReason(err), err: err}
+}
+
+// imageDownloadErrorReason classifies err by type only. Redirect failures
+// cannot be told apart this way (net/http formats them with %v or creates
+// them with errors.New), so they are reported as "other".
+func imageDownloadErrorReason(err error) string {
+	var urlErr *url.Error
+	var netErr net.Error
+	var opErr *net.OpError
+	var dnsErr *net.DNSError
+	var blockedErr *imageDownloadHostNotAllowedError
+	switch {
+	case errors.As(err, &blockedErr):
+		return blockedErr.Error()
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &netErr) && netErr.Timeout():
+		return "timeout"
+	case errors.As(err, &urlErr) && urlErr.Op == "parse":
+		return "invalid_url"
+	case errors.As(err, &opErr), errors.As(err, &dnsErr):
+		return "connection"
+	default:
+		return "other"
+	}
 }
 
 func (u *ImageResultUploader) buildKey(taskID string, index int, contentType string) string {

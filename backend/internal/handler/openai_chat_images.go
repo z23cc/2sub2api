@@ -260,8 +260,9 @@ func (h *OpenAIGatewayHandler) offloadChatImages(c *gin.Context, reqLog *zap.Log
 // writeChatImagesError reports a failed image attempt. Before anything is
 // committed it repeats the Images status and OpenAI error body. Once the
 // stream or a JSON keepalive has committed 200, the error is marked as a
-// request failure that counts towards the SLA: streams send it as an
-// "event: error" frame followed by [DONE], JSON as the error body.
+// request failure that counts towards the SLA: streams send it as a data-only
+// frame carrying the recorded error object followed by [DONE], JSON as the
+// error body.
 func (h *OpenAIGatewayHandler) writeChatImagesError(c *gin.Context, sse *chatImagesSSE, recorder *httptest.ResponseRecorder, outcome internalImageOutcome, jsonCommitted bool) {
 	errorObject := outcome.ErrorObject()
 	payload, err := json.Marshal(map[string]json.RawMessage{"error": errorObject})

@@ -3,6 +3,7 @@
 package apicompat
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -91,6 +92,27 @@ func TestChatCompletionsToImagesRequest(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsToImagesRequestRejectsEmptyImageURL(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		part string
+	}{
+		{name: "missing url", part: `{}`},
+		{name: "empty url", part: `{"url":""}`},
+		{name: "blank url", part: `{"url":"  "}`},
+		{name: "empty string", part: `""`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			body := fmt.Sprintf(`{"model":"gpt-image-1","messages":[{"role":"user","content":[{"type":"text","text":"Edit this image"},{"type":"image_url","image_url":%s}]}]}`, tt.part)
+			got, err := ChatCompletionsToImagesRequest([]byte(body))
+			var requestErr *ChatImagesRequestError
+			require.ErrorAs(t, err, &requestErr)
+			require.Equal(t, "image_url content parts must include a non-empty url", requestErr.Message)
+			require.Nil(t, got)
+		})
+	}
+}
+
 func TestImagesResultToChatContent(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -101,10 +123,10 @@ func TestImagesResultToChatContent(t *testing.T) {
 		wantError string
 	}{
 		{
-			name:      "response format, multiple images, URL precedence and reported total",
-			result:    `{"output_format":"jpeg","data":[{"b64_json":"aGk="},{"url":"https://example.com/cat.png","b64_json":"aGk="},{"b64_json":"eWVz"}],"usage":{"input_tokens":5,"output_tokens":10,"total_tokens":16}}`,
+			name:      "response format, multiple images, base64 precedence and reported total",
+			result:    `{"output_format":"jpeg","data":[{"b64_json":"aGk="},{"url":"https://example.com/expired.png","b64_json":"eWVz"},{"url":"https://example.com/cat.png"}],"usage":{"input_tokens":5,"output_tokens":10,"total_tokens":16}}`,
 			requested: "webp",
-			content:   "![image](data:image/jpeg;base64,aGk=)\n\n![image](https://example.com/cat.png)\n\n![image](data:image/jpeg;base64,eWVz)",
+			content:   "![image](data:image/jpeg;base64,aGk=)\n\n![image](data:image/jpeg;base64,eWVz)\n\n![image](https://example.com/cat.png)",
 			usage:     &ChatUsage{PromptTokens: 5, CompletionTokens: 10, TotalTokens: 16},
 		},
 		{

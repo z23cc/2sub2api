@@ -91,35 +91,40 @@ func (h *OpenAIGatewayHandler) chatCompletionsImages(c *gin.Context, reqLog *zap
 
 	h.Images(inner)
 
+	// Images has returned, so the recorder and inner keys are safe to read.
+	// The keepalive keeps running through the object storage upload below,
+	// which reads only the recorded result and never writes the client.
+	mergeChatImagesKeys(c, inner)
+	setOpsRequestContext(c, reqModel, reqStream)
+	setOpsEndpointContext(c, "", int16(service.RequestTypeFromLegacy(reqStream, false)))
+
+	outcome := readInternalImageOutcome(inner, recorder)
+	var content string
+	var usage *apicompat.ChatUsage
+	if outcome.Succeeded() {
+		result := h.offloadChatImages(c, reqLog, outcome.Body)
+		var err error
+		content, usage, err = apicompat.ImagesResultToChatContent(result, imagesReq.OutputFormat)
+		if err != nil {
+			// Images bills only images it counted, so an empty result was not charged.
+			reqLog.Warn("openai_chat_completions.images_result_unrenderable", zap.Error(err))
+			outcome = internalImageOutcome{StatusCode: http.StatusBadGateway, InvalidSuccess: true}
+		}
+	}
+
 	jsonCommitted := false
 	if sse != nil {
 		sse.stop()
 	} else {
 		jsonCommitted = service.StopOpenAIImagesJSONKeepaliveCommitted(c)
 	}
-	mergeChatImagesKeys(c, inner)
-	setOpsRequestContext(c, reqModel, reqStream)
-	setOpsEndpointContext(c, "", int16(service.RequestTypeFromLegacy(reqStream, false)))
 
-	outcome := readInternalImageOutcome(inner, recorder)
 	if outcome.ContextDone {
 		reqLog.Info("openai_chat_completions.images_client_gone")
 		return
 	}
 	if !outcome.Succeeded() {
 		h.writeChatImagesError(c, sse, recorder, outcome, jsonCommitted)
-		return
-	}
-
-	result := h.offloadChatImages(c, reqLog, outcome.Body)
-	content, usage, err := apicompat.ImagesResultToChatContent(result, imagesReq.OutputFormat)
-	if err != nil {
-		// Images bills only images it counted, so an empty result was not charged.
-		reqLog.Warn("openai_chat_completions.images_result_unrenderable", zap.Error(err))
-		h.writeChatImagesError(c, sse, recorder, internalImageOutcome{
-			StatusCode:     http.StatusBadGateway,
-			InvalidSuccess: true,
-		}, jsonCommitted)
 		return
 	}
 

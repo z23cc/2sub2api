@@ -69,6 +69,14 @@ func TestScopedAdminPolicyAccountRulesNeverCrossProduct(t *testing.T) {
 	require.False(t, RouteAllowed(p, "POST", "/api/v1/admin/openai/refresh-token"))
 }
 
+func TestScopedAdminCreateAllowsOpenAIRefreshToken(t *testing.T) {
+	create := Policy{Rules: []Rule{{Permissions: []string{"accounts.create"}, GroupIDs: []int64{1}, AccountTypes: []string{"oauth"}}}}
+	require.True(t, RouteAllowed(create, "POST", "/api/v1/admin/openai/refresh-token"))
+	require.True(t, RouteAllowed(create, "POST", "/api/v1/admin/accounts/import/codex-session"))
+	require.False(t, RouteAllowed(create, "POST", "/api/v1/admin/openai/accounts/:id/refresh"))
+	require.False(t, RouteAllowed(Policy{}, "POST", "/api/v1/admin/openai/refresh-token"))
+}
+
 func TestScopedAdminPolicyGroupChanges(t *testing.T) {
 	a := Account{GroupIDs: []int64{1, 2}, Type: "oauth", Platform: "openai"}
 	p := Policy{Rules: []Rule{{Permissions: []string{"accounts.groups"}, GroupIDs: []int64{1, 3}, AccountTypes: []string{"oauth"}}}}

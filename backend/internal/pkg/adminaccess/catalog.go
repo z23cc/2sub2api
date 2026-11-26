@@ -21,7 +21,8 @@ var definitions = []permissionDefinition{
 	{Permission{"lottery.write", "管理抽奖奖池与奖品", "财务", "global"}, []string{"PUT /lottery/settings", "POST /lottery/pools", "PUT /lottery/pools/:id", "DELETE /lottery/pools/:id", "POST /lottery/pools/:id/prizes", "PUT /lottery/pools/:id/prizes/:prize_id", "DELETE /lottery/pools/:id/prizes/:prize_id"}},
 	{Permission{"accounts.read", "查看账户（脱敏）", "账户", "account"}, []string{"GET /accounts", "GET /accounts/:id", "GET /accounts/:id/models"}},
 	{Permission{"accounts.usage.read", "读取账户用量与额度", "账户", "account"}, []string{"POST /accounts/today-stats/batch", "GET /accounts/:id/stats", "POST /accounts/usage/batch"}},
-	{Permission{"accounts.create", "创建账户", "账户", "account"}, []string{"POST /accounts", "POST /accounts/import/codex-session"}},
+	// refresh-token 只用 RT 换出 token、不碰已有账户，供管理平台在导入前换 token。
+	{Permission{"accounts.create", "创建账户", "账户", "account"}, []string{"POST /accounts", "POST /accounts/import/codex-session", "POST /openai/refresh-token"}},
 	{Permission{"accounts.update", "编辑名称与备注", "账户", "account"}, []string{"PUT /accounts/:id"}},
 	{Permission{"accounts.credentials", "写入凭证（不包含读取）", "账户", "account"}, []string{"PUT /accounts/:id"}},
 	{Permission{"accounts.models.write", "编辑账户白名单模型 ID 与映射", "账户", "account"}, []string{"PUT /accounts/:id", "POST /accounts/bulk-update"}},
